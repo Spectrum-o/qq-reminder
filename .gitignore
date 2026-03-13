@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+data/
+*.db
+.env
+config.json
+course.txt
+assignments.json
+recurring_assignments.json

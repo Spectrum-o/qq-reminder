@@ -1,0 +1,12 @@
+[
+    {
+        "id": "os-weekly-lab",
+        "course": "操作系统",
+        "description_template": "实验报告第{sequence}次 ({date})",
+        "start_date": "2026-03-13",
+        "time": "23:59",
+        "interval_days": 7,
+        "generate_days_ahead": 14,
+        "end_date": "2026-06-26"
+    }
+]
