@@ -1,4 +1,4 @@
-# QQ Homework Bot
+# QQ Reminder Bot
 
 基于 NoneBot2 + OneBot V11 的个人 QQ 机器人，用于：
 
