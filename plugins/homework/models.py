@@ -36,6 +36,7 @@ class ReminderDraft:
     title: str
     body: str
     remind_at: str
+    user_id: str = ""
 
 
 @dataclass(frozen=True)

@@ -9,7 +9,7 @@ require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler  # noqa: E402
 
 from .course_parser import parse_courses, Course  # noqa: E402
-from .database import add_reminder, delete_future_reminders_by_date  # noqa: E402
+from .database import add_reminder, delete_future_reminders_by_date, get_all_subscribers, get_subscriptions  # noqa: E402
 from .models import ReminderDraft  # noqa: E402
 from .paths import COURSE_REMINDER_CONFIG_PATH  # noqa: E402
 
@@ -137,11 +137,6 @@ async def generate_course_reminders_for_date(target_date: date | None = None):
     if not config:
         return
 
-    course_filter = config.get("courses", [])
-    if not course_filter:
-        await delete_future_reminders_by_date("course", date_str)
-        return
-
     try:
         advance_minutes = int(config.get("advance_minutes", 15))
     except (TypeError, ValueError):
@@ -152,11 +147,12 @@ async def generate_course_reminders_for_date(target_date: date | None = None):
         return
 
     all_courses = parse_courses()
-    # Filter to only configured courses
-    filtered = [c for c in all_courses if c.name in course_filter]
+    today_courses = _get_today_courses(all_courses, config, target_date)
 
-    today_courses = _get_today_courses(filtered, config, target_date)
+    # Get all subscribers
+    all_subs = await get_all_subscribers()
 
+    # Delete all future course reminders for today (regenerate)
     await delete_future_reminders_by_date("course", date_str)
 
     added = 0
@@ -182,16 +178,21 @@ async def generate_course_reminders_for_date(target_date: date | None = None):
             f"  {c['name']}  (第{c['period']}节 {c['time']})\n"
             f"  教师: {c['teacher']}{location_info}"
         )
-        await add_reminder(
-            ReminderDraft(
-                type="course",
-                ref_id=ref_id,
-                title=f"上课: {c['name']}",
-                body=body,
-                remind_at=remind_at,
+
+        # Generate reminder for each subscriber of this course
+        subscribers = all_subs.get(c["name"], [])
+        for user_id in subscribers:
+            await add_reminder(
+                ReminderDraft(
+                    type="course",
+                    ref_id=ref_id,
+                    title=f"上课: {c['name']}",
+                    body=body,
+                    remind_at=remind_at,
+                    user_id=user_id,
+                )
             )
-        )
-        added += 1
+            added += 1
 
     if added:
         logger.info(f"Generated {added} course reminders for {date_str}")
@@ -209,9 +210,20 @@ async def refresh_course_reminder_job():
 
 
 def get_today_schedule() -> list[dict]:
-    """Get today's full course schedule (all courses, not just reminder-configured ones)."""
+    """Get today's full course schedule (all courses)."""
     config = _load_config()
     if not config:
         return []
     all_courses = parse_courses()
     return _get_today_courses(all_courses, config, date.today())
+
+
+async def get_today_schedule_for_user(user_id: str) -> list[dict]:
+    """Get today's schedule filtered by user's subscriptions."""
+    config = _load_config()
+    if not config:
+        return []
+    all_courses = parse_courses()
+    subscriptions = set(await get_subscriptions(user_id))
+    filtered = [c for c in all_courses if c.name in subscriptions]
+    return _get_today_courses(filtered, config, date.today())

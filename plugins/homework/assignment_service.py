@@ -12,6 +12,11 @@ from .database import (
     create_assignment,
     delete_assignment,
     delete_reminders_by_ref,
+    get_all_approved_user_ids,
+    get_subscribers_for_course,
+    get_subscriptions,
+    is_assignment_done_by,
+    list_all_undone_assignments,
     list_pending,
     list_undone_assignments,
     mark_done,
@@ -36,7 +41,7 @@ def parse_command_deadline(deadline_text: str) -> str:
 
 
 def _build_homework_reminders(
-    assignment_id: int, course: str, description: str, deadline: str
+    assignment_id: int, course: str, description: str, deadline: str, user_id: str
 ) -> list[ReminderDraft]:
     try:
         deadline_dt = datetime.strptime(deadline, STORED_DATETIME_FORMAT)
@@ -63,6 +68,7 @@ def _build_homework_reminders(
                     f"  回复 /done {assignment_id} 标记完成"
                 ),
                 remind_at=remind_dt.strftime(STORED_DATETIME_FORMAT),
+                user_id=user_id,
             )
         )
     return reminders
@@ -71,8 +77,28 @@ def _build_homework_reminders(
 async def sync_homework_reminders(
     assignment_id: int, course: str, description: str, deadline: str
 ) -> None:
-    reminders = _build_homework_reminders(assignment_id, course, description, deadline)
-    await sync_reminders("homework", str(assignment_id), reminders)
+    """Generate/sync homework reminders for all subscribers of this course."""
+    subscribers = await get_subscribers_for_course(course)
+    for user_id in subscribers:
+        if await is_assignment_done_by(user_id, assignment_id):
+            continue
+        reminders = _build_homework_reminders(
+            assignment_id, course, description, deadline, user_id
+        )
+        await sync_reminders("homework", str(assignment_id), reminders, user_id)
+
+
+async def sync_homework_reminders_for_user(user_id: str) -> None:
+    """Regenerate all homework reminders for a specific user.
+    Called when user subscribes to new courses."""
+    subscriptions = set(await get_subscriptions(user_id))
+    rows = await list_undone_assignments(user_id)
+    for row in rows:
+        if row["course"] in subscriptions:
+            reminders = _build_homework_reminders(
+                row["id"], row["course"], row["description"], row["deadline"], user_id
+            )
+            await sync_reminders("homework", str(row["id"]), reminders, user_id)
 
 
 async def apply_assignment_sync_outcome(outcome: SyncOutcome) -> None:
@@ -100,8 +126,8 @@ async def add_manual_assignment(course: str, description: str, deadline: str) ->
     return assignment_id
 
 
-async def list_pending_message() -> str:
-    rows = await list_pending()
+async def list_pending_message(user_id: str) -> str:
+    rows = await list_pending(user_id)
     if not rows:
         return "没有待完成的作业!"
 
@@ -126,10 +152,10 @@ async def list_pending_message() -> str:
     return "\n".join(lines)
 
 
-async def complete_assignment(assignment_id: int) -> bool:
-    ok = await mark_done(assignment_id)
+async def complete_assignment(user_id: str, assignment_id: int) -> bool:
+    ok = await mark_done(user_id, assignment_id)
     if ok:
-        await delete_reminders_by_ref("homework", str(assignment_id))
+        await delete_reminders_by_ref("homework", str(assignment_id), user_id=user_id)
     return ok
 
 
@@ -141,14 +167,23 @@ async def remove_assignment(assignment_id: int) -> bool:
 
 
 async def backfill_homework_reminders() -> None:
-    rows = await list_undone_assignments()
-    for row in rows:
-        await sync_homework_reminders(
-            row["id"],
-            row["course"],
-            row["description"],
-            row["deadline"],
-        )
+    """Called at startup. Regenerates homework reminders for all approved users."""
+    user_ids = await get_all_approved_user_ids()
+    rows = await list_all_undone_assignments()
+    if not rows:
+        return
+
+    for user_id in user_ids:
+        subscriptions = set(await get_subscriptions(user_id))
+        for row in rows:
+            if row["course"] not in subscriptions:
+                continue
+            if await is_assignment_done_by(user_id, row["id"]):
+                continue
+            reminders = _build_homework_reminders(
+                row["id"], row["course"], row["description"], row["deadline"], user_id
+            )
+            await sync_reminders("homework", str(row["id"]), reminders, user_id)
 
 
 def _json_source_key(course: str, description: str, deadline: str) -> str:
@@ -234,7 +269,7 @@ async def sync_assignments_from_json() -> None:
         )
 
 
-async def format_stats() -> str:
+async def format_stats(user_id: str) -> str:
     now = datetime.now()
 
     # 本周: 周一 00:00
@@ -244,10 +279,10 @@ async def format_stats() -> str:
     # 本月: 1号 00:00
     month_start = f"{now.year}-{now.month:02d}-01 00:00"
 
-    week_done = await count_assignments(done=1, created_since=week_start)
-    week_pending = await count_assignments(done=0, created_since=week_start)
-    month_done = await count_assignments(done=1, created_since=month_start)
-    month_pending = await count_assignments(done=0, created_since=month_start)
+    week_done = await count_assignments(user_id, done=1, created_since=week_start)
+    week_pending = await count_assignments(user_id, done=0, created_since=week_start)
+    month_done = await count_assignments(user_id, done=1, created_since=month_start)
+    month_pending = await count_assignments(user_id, done=0, created_since=month_start)
 
     lines = [
         "作业统计:",
@@ -257,8 +292,8 @@ async def format_stats() -> str:
     ]
 
     # 按课程分组（全部时间）
-    done_by_course = dict(await count_assignments_by_course(done=1))
-    pending_by_course = dict(await count_assignments_by_course(done=0))
+    done_by_course = dict(await count_assignments_by_course(user_id, done=1))
+    pending_by_course = dict(await count_assignments_by_course(user_id, done=0))
     all_courses = sorted(set(done_by_course) | set(pending_by_course))
 
     if all_courses:

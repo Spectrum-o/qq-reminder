@@ -14,7 +14,7 @@ from .assignment_service import (
     remove_assignment,
 )
 from .config import LLM_API_BASE, LLM_API_KEY, LLM_MODEL
-from .course_service import format_today_schedule
+from .course_service import format_today_schedule_for_user
 from .database import add_reminder, delete_reminder, list_pending_custom_reminders
 from .models import ReminderDraft, STORED_DATETIME_FORMAT
 from .time_parser import parse_natural_deadline
@@ -144,7 +144,7 @@ def _strip_think_tags(text: str) -> str:
     return _RE_THINK_TAGS.sub("", text).strip()
 
 
-def _build_system_prompt(context: str, use_json_fallback: bool) -> str:
+def _build_system_prompt(context: str, use_json_fallback: bool, is_admin: bool) -> str:
     now = datetime.now()
     weekday = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][now.weekday()]
     prompt = (
@@ -153,6 +153,10 @@ def _build_system_prompt(context: str, use_json_fallback: bool) -> str:
         "回复要简洁，像朋友间聊天一样自然，不要用 markdown 格式。\n"
         f"\n当前时间: {now.strftime('%Y-%m-%d %H:%M')} {weekday}\n"
     )
+    if is_admin:
+        prompt += "\n当前用户是管理员，可以添加和删除课程作业。\n"
+    else:
+        prompt += "\n当前用户是普通用户，只能标记完成和设置提醒，不能添加或删除课程作业。\n"
     if use_json_fallback:
         prompt += f"\n{_JSON_FALLBACK_INSTRUCTIONS}\n"
     prompt += f"\n{context}"
@@ -168,7 +172,14 @@ def _build_context(assignments_text: str, schedule_text: str) -> str:
     return "\n\n".join(parts) if parts else "当前没有作业，今天没有课程。"
 
 
-async def chat(user_message: str, assignments_text: str, schedule_text: str) -> str:
+async def chat(
+    user_message: str,
+    assignments_text: str,
+    schedule_text: str,
+    *,
+    user_id: str = "",
+    is_admin: bool = False,
+) -> str:
     """Send user message to LLM, execute any tool calls, return final reply."""
     if not LLM_API_BASE:
         return ""
@@ -178,57 +189,18 @@ async def chat(user_message: str, assignments_text: str, schedule_text: str) -> 
 
     # JSON-in-text mode: works with all OpenAI-compatible APIs including
     # proxies that don't support function calling (e.g. SDU DeepSeek).
-    return await _try_json_fallback(client, user_message, context)
-
-
-async def _try_function_calling(
-    client: AsyncOpenAI, user_message: str, context: str
-) -> str | None:
-    """Try OpenAI function calling. Returns None if the API doesn't support it."""
-    system_prompt = _build_system_prompt(context, use_json_fallback=False)
-    try:
-        response = await client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ],
-            tools=TOOLS,
-            tool_choice="auto",
-        )
-    except Exception as exc:
-        # If the API rejects the tools parameter, return None to trigger fallback
-        error_msg = str(exc).lower()
-        if "tool" in error_msg or "function" in error_msg or "parameter" in error_msg:
-            logger.warning(f"Function calling not supported, falling back: {exc}")
-            return None
-        logger.error(f"LLM API error: {exc}")
-        return "AI 服务暂时不可用，请稍后再试"
-
-    message = response.choices[0].message
-
-    if message.tool_calls:
-        results = []
-        for tool_call in message.tool_calls:
-            name = tool_call.function.name
-            try:
-                args = json.loads(tool_call.function.arguments)
-            except json.JSONDecodeError:
-                results.append(f"参数解析失败: {tool_call.function.arguments}")
-                continue
-            results.append(await _execute_tool(name, args))
-        return "\n".join(results)
-
-    # Model responded with text (no tool calls) — still valid
-    content = message.content or ""
-    return _strip_think_tags(content)
+    return await _try_json_fallback(client, user_message, context, user_id, is_admin)
 
 
 async def _try_json_fallback(
-    client: AsyncOpenAI, user_message: str, context: str
+    client: AsyncOpenAI,
+    user_message: str,
+    context: str,
+    user_id: str,
+    is_admin: bool,
 ) -> str:
     """Fallback: ask LLM to embed actions as JSON in text response."""
-    system_prompt = _build_system_prompt(context, use_json_fallback=True)
+    system_prompt = _build_system_prompt(context, use_json_fallback=True, is_admin=is_admin)
     try:
         response = await client.chat.completions.create(
             model=LLM_MODEL,
@@ -253,7 +225,7 @@ async def _try_json_fallback(
             action_data = json.loads(match.group(1))
             action_name = action_data.get("action", "")
             action_args = action_data.get("args", {})
-            result = await _execute_tool(action_name, action_args)
+            result = await _execute_tool(action_name, action_args, user_id, is_admin)
             return f"{display_text}\n{result}".strip() if display_text else result
         except (json.JSONDecodeError, KeyError) as exc:
             logger.warning(f"Failed to parse ACTION JSON: {exc}")
@@ -261,9 +233,11 @@ async def _try_json_fallback(
     return content
 
 
-async def _execute_tool(name: str, args: dict) -> str:
+async def _execute_tool(name: str, args: dict, user_id: str, is_admin: bool) -> str:
     try:
         if name == "add_assignment":
+            if not is_admin:
+                return "只有管理员可以添加课程作业"
             try:
                 deadline_iso = parse_natural_deadline(args["deadline"])
             except ValueError:
@@ -275,16 +249,18 @@ async def _execute_tool(name: str, args: dict) -> str:
 
         if name == "complete_assignment":
             aid = int(args["assignment_id"])
-            ok = await complete_assignment(aid)
+            ok = await complete_assignment(user_id, aid)
             return f"作业 #{aid} 已完成!" if ok else f"未找到编号 #{aid} 的待完成作业"
 
         if name == "delete_assignment":
+            if not is_admin:
+                return "只有管理员可以删除课程作业"
             aid = int(args["assignment_id"])
             ok = await remove_assignment(aid)
             return f"作业 #{aid} 已删除" if ok else f"未找到编号 #{aid} 的作业"
 
         if name == "list_assignments":
-            return await list_pending_message()
+            return await list_pending_message(user_id)
 
         if name == "add_custom_reminder":
             try:
@@ -299,15 +275,16 @@ async def _execute_tool(name: str, args: dict) -> str:
                     title=f"提醒: {title}",
                     body=f"提醒: {title}",
                     remind_at=remind_at,
+                    user_id=user_id,
                 )
             )
             return f"已设置提醒: {title} ({remind_at})"
 
         if name == "today_schedule":
-            return format_today_schedule()
+            return await format_today_schedule_for_user(user_id)
 
         if name == "list_reminders":
-            rows = await list_pending_custom_reminders()
+            rows = await list_pending_custom_reminders(user_id)
             if not rows:
                 return "没有待发送的提醒"
             now = datetime.now()
@@ -324,7 +301,7 @@ async def _execute_tool(name: str, args: dict) -> str:
 
         if name == "cancel_reminder":
             rid = int(args["reminder_id"])
-            ok = await delete_reminder(rid)
+            ok = await delete_reminder(rid, user_id)
             return f"提醒 #{rid} 已取消" if ok else f"未找到编号 #{rid} 的待发送提醒"
 
         return f"未知操作: {name}"
