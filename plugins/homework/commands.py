@@ -64,7 +64,7 @@ async def _check_admin(event: PrivateMessageEvent) -> str | None:
     return None
 
 
-_PENDING_MSG = "你还未通过注册审核，请等待管理员审核"
+_PENDING_MSG = "你还未通过注册审核，请等待管理员审核\n审核通过后发送 /help 查看所有功能"
 _ADMIN_ONLY_MSG = "只有管理员可以执行此操作"
 
 
@@ -414,6 +414,18 @@ async def handle_approve(bot: Bot, event: PrivateMessageEvent, args: Message = C
     ok = await approve_user(target_qq, admin_id, role)
     if ok:
         role_label = "管理员" if role == ROLE_ADMIN else "用户"
+        # Notify the approved user
+        try:
+            await bot.send_private_msg(
+                user_id=int(target_qq),
+                message=(
+                    f"你的注册已通过审核 (角色: {role_label})\n"
+                    "发送 /help 查看所有功能\n"
+                    "发送 /subscribe all 订阅所有课程"
+                ),
+            )
+        except Exception:
+            pass  # Best effort, don't fail the approve command
         await approve_cmd.finish(f"已通过 {target_qq} 的注册 (角色: {role_label})")
     else:
         await approve_cmd.finish(f"审核失败: 用户 {target_qq} 不存在或已审核")

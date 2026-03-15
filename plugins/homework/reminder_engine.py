@@ -24,6 +24,7 @@ async def dispatch_reminders():
             # Legacy reminder without user_id, fall back to OWNER_QQ
             user_id = str(OWNER_QQ).strip() if OWNER_QQ else ""
         if not user_id:
+            logger.warning(f"Dropping reminder #{r['id']}: no user_id and OWNER_QQ not configured")
             await mark_reminder_sent(r["id"])
             continue
 
