@@ -9,8 +9,8 @@ require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler  # noqa: E402
 
 from .config import OWNER_QQ  # noqa: E402
-from .course_reminder import get_today_schedule  # noqa: E402
-from .database import list_pending, list_pending_custom_reminders  # noqa: E402
+from .course_reminder import get_today_schedule_for_user  # noqa: E402
+from .database import get_all_approved_user_ids, list_pending, list_pending_custom_reminders  # noqa: E402
 from .models import STORED_DATETIME_FORMAT  # noqa: E402
 
 WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
@@ -26,15 +26,15 @@ def _relative_day_label(delta_days: int) -> str:
     return f"{delta_days}天后"
 
 
-async def build_daily_briefing() -> str:
+async def build_daily_briefing(user_id: str) -> str:
     now = datetime.now()
     today_str = now.strftime("%m月%d日")
     weekday_str = WEEKDAY_NAMES[now.weekday()]
 
     lines = [f"早上好! 今天是 {today_str} {weekday_str}"]
 
-    # ── 今日课程 ──
-    schedule = get_today_schedule()
+    # ── 今日课程（按用户订阅过滤）──
+    schedule = await get_today_schedule_for_user(user_id)
     lines.append("")
     if schedule:
         lines.append("今日课程:")
@@ -44,8 +44,8 @@ async def build_daily_briefing() -> str:
     else:
         lines.append("今日无课程")
 
-    # ── 近 3 天截止作业 ──
-    rows = await list_pending()
+    # ── 近 3 天截止作业（按用户完成状态过滤）──
+    rows = await list_pending(user_id)
     cutoff = now + timedelta(days=3)
     upcoming = []
     for row in rows:
@@ -72,8 +72,8 @@ async def build_daily_briefing() -> str:
     else:
         lines.append("近3天无作业截止")
 
-    # ── 今日提醒 ──
-    custom_reminders = await list_pending_custom_reminders()
+    # ── 今日提醒（按用户过滤）──
+    custom_reminders = await list_pending_custom_reminders(user_id)
     today_reminders = []
     for r in custom_reminders:
         try:
@@ -93,22 +93,17 @@ async def build_daily_briefing() -> str:
 
 @scheduler.scheduled_job("cron", hour=8, minute=0, id="daily_briefing")
 async def daily_briefing_job():
-    if not OWNER_QQ:
-        return
-    try:
-        owner_qq = int(str(OWNER_QQ).strip())
-    except ValueError:
-        logger.error(f"Invalid OWNER_QQ: {OWNER_QQ!r}")
-        return
     try:
         bot = get_bot()
     except ValueError:
         logger.warning("Daily briefing skipped: no bot connected")
         return
 
-    msg = await build_daily_briefing()
-    try:
-        await bot.send_private_msg(user_id=owner_qq, message=msg)
-        logger.info("Sent daily briefing")
-    except Exception as exc:
-        logger.error(f"Failed to send daily briefing: {exc}")
+    user_ids = await get_all_approved_user_ids()
+    for user_id in user_ids:
+        try:
+            msg = await build_daily_briefing(user_id)
+            await bot.send_private_msg(user_id=int(user_id), message=msg)
+            logger.info(f"Sent daily briefing to {user_id}")
+        except Exception as exc:
+            logger.error(f"Failed to send daily briefing to {user_id}: {exc}")

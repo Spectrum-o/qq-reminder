@@ -12,7 +12,7 @@
         "9": "18:30",
         "10": "19:20"
     },
-    "advance_minutes": 15,
+    "advance_minutes": 180,
     "courses": [
         "操作系统",
         "算法设计与分析"

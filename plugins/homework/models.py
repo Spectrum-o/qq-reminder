@@ -27,6 +27,8 @@ class AssignmentDraft:
     deadline: str
     source_type: str = SOURCE_MANUAL
     source_key: str | None = None
+    visibility: str = "public"
+    owner_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -36,6 +38,7 @@ class ReminderDraft:
     title: str
     body: str
     remind_at: str
+    user_id: str = ""
 
 
 @dataclass(frozen=True)
