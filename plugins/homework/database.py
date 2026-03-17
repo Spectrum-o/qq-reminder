@@ -111,6 +111,13 @@ async def init_db() -> None:
 
         await _ensure_column(db, "reminders", "user_id", "TEXT NOT NULL DEFAULT ''")
 
+        await _ensure_column(
+            db, "user_course_subscriptions", "notify_class", "INTEGER NOT NULL DEFAULT 0"
+        )
+
+        await _ensure_column(db, "assignments", "visibility", "TEXT NOT NULL DEFAULT 'public'")
+        await _ensure_column(db, "assignments", "owner_id", "TEXT NOT NULL DEFAULT ''")
+
         # ── Data migration (single-user → multi-user) ──
 
         from .config import OWNER_QQ
@@ -139,7 +146,10 @@ async def init_db() -> None:
         # ── Indexes ──
 
         await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_assignments_pending ON assignments(done, deadline)"
+            "DROP INDEX IF EXISTS idx_assignments_pending"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_assignments_deadline ON assignments(deadline)"
         )
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_assignments_source ON assignments(source_type, source_key)"
@@ -172,8 +182,8 @@ async def create_assignment(draft: AssignmentDraft) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
             """
-            INSERT INTO assignments (course, description, deadline, source_type, source_key)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO assignments (course, description, deadline, source_type, source_key, visibility, owner_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 draft.course,
@@ -181,6 +191,8 @@ async def create_assignment(draft: AssignmentDraft) -> int:
                 draft.deadline,
                 draft.source_type,
                 draft.source_key,
+                draft.visibility,
+                draft.owner_id,
             ),
         )
         await db.commit()
@@ -191,7 +203,7 @@ async def get_assignment(assignment_id: int) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT id, course, description, deadline, source_type, source_key FROM assignments WHERE id = ?",
+            "SELECT id, course, description, deadline, source_type, source_key, visibility, owner_id FROM assignments WHERE id = ?",
             (assignment_id,),
         ) as cursor:
             row = await cursor.fetchone()
@@ -203,13 +215,14 @@ async def list_pending(user_id: str) -> list[dict]:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             """
-            SELECT a.id, a.course, a.description, a.deadline, a.source_type, a.source_key
+            SELECT a.id, a.course, a.description, a.deadline, a.source_type, a.source_key, a.visibility, a.owner_id
             FROM assignments a
             LEFT JOIN user_completions uc ON a.id = uc.assignment_id AND uc.user_id = ?
             WHERE uc.id IS NULL
+              AND (a.visibility = 'public' OR a.owner_id = ?)
             ORDER BY datetime(a.deadline) ASC, a.id ASC
             """,
-            (user_id,),
+            (user_id, user_id),
         ) as cursor:
             return [dict(row) async for row in cursor]
 
@@ -223,13 +236,14 @@ async def list_undone_assignments(
 ) -> list[dict]:
     query = [
         """
-        SELECT a.id, a.course, a.description, a.deadline, a.source_type, a.source_key
+        SELECT a.id, a.course, a.description, a.deadline, a.source_type, a.source_key, a.visibility, a.owner_id
         FROM assignments a
         LEFT JOIN user_completions uc ON a.id = uc.assignment_id AND uc.user_id = ?
         WHERE uc.id IS NULL
+          AND (a.visibility = 'public' OR a.owner_id = ?)
         """
     ]
-    params: list[str] = [user_id]
+    params: list[str] = [user_id, user_id]
 
     if source_type is not None:
         query.append("AND a.source_type = ?")
@@ -249,13 +263,13 @@ async def list_undone_assignments(
             return [dict(row) async for row in cursor]
 
 
-async def list_all_undone_assignments() -> list[dict]:
-    """List all assignments not completed by ANY user (for sync/backfill)."""
+async def list_all_assignments() -> list[dict]:
+    """List all assignments (for sync/backfill). Caller filters per-user completion."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             """
-            SELECT id, course, description, deadline, source_type, source_key
+            SELECT id, course, description, deadline, source_type, source_key, visibility, owner_id
             FROM assignments
             ORDER BY datetime(deadline) ASC, id ASC
             """
@@ -527,6 +541,87 @@ async def delete_future_reminders_by_date(
         await db.commit()
 
 
+def _escape_like_pattern(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+async def delete_subscriptions_by_course(course_name: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "DELETE FROM user_course_subscriptions WHERE course_name = ?",
+            (course_name,),
+        )
+        await db.commit()
+        return cursor.rowcount
+
+
+async def delete_reminders_by_course(course_name: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Course-type reminders: ref_id format is "{course}@{date}@{period}"
+        course_ref_prefix = f"{_escape_like_pattern(course_name)}@%"
+        c1 = await db.execute(
+            "DELETE FROM reminders WHERE sent = 0 AND type = 'course' AND ref_id LIKE ? ESCAPE '\\'",
+            (course_ref_prefix,),
+        )
+        # Homework-type reminders: ref_id is assignment ID as text
+        c2 = await db.execute(
+            """
+            DELETE FROM reminders WHERE sent = 0 AND type = 'homework' AND ref_id IN (
+                SELECT CAST(id AS TEXT) FROM assignments WHERE course = ?
+            )
+            """,
+            (course_name,),
+        )
+        await db.commit()
+        return c1.rowcount + c2.rowcount
+
+
+async def delete_assignments_by_course(course_name: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id FROM assignments WHERE course = ?", (course_name,)
+        )
+        ids = [row[0] async for row in cursor]
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            await db.execute(
+                f"DELETE FROM user_completions WHERE assignment_id IN ({placeholders})",
+                ids,
+            )
+            await db.execute(
+                f"DELETE FROM assignments WHERE id IN ({placeholders})",
+                ids,
+            )
+        await db.commit()
+        return len(ids)
+
+
+async def delete_homework_reminders_for_user_courses(
+    user_id: str, course_names: list[str]
+) -> int:
+    if not course_names:
+        return 0
+
+    placeholders = ",".join("?" for _ in course_names)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            f"""
+            DELETE FROM reminders
+            WHERE sent = 0
+              AND type = 'homework'
+              AND user_id = ?
+              AND ref_id IN (
+                  SELECT CAST(id AS TEXT)
+                  FROM assignments
+                  WHERE course IN ({placeholders})
+              )
+            """,
+            [user_id, *course_names],
+        )
+        await db.commit()
+        return cursor.rowcount
+
+
 async def cleanup_old_reminders(days: int = 7) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -548,20 +643,23 @@ async def count_assignments(
             """
             SELECT COUNT(*) FROM assignments a
             INNER JOIN user_completions uc ON a.id = uc.assignment_id AND uc.user_id = ?
-            WHERE 1=1
+            WHERE (a.visibility = 'public' OR a.owner_id = ?)
             """
         ]
+        params: list = [user_id, user_id]
     elif done == 0:
         query = [
             """
             SELECT COUNT(*) FROM assignments a
             LEFT JOIN user_completions uc ON a.id = uc.assignment_id AND uc.user_id = ?
             WHERE uc.id IS NULL
+              AND (a.visibility = 'public' OR a.owner_id = ?)
             """
         ]
+        params = [user_id, user_id]
     else:
-        query = ["SELECT COUNT(*) FROM assignments a WHERE 1=1"]
-    params: list = [] if done is None else [user_id]
+        query = ["SELECT COUNT(*) FROM assignments a WHERE (a.visibility = 'public' OR a.owner_id = ?)"]
+        params = [user_id]
     if created_since is not None:
         query.append("AND datetime(a.created_at) >= datetime(?)")
         params.append(created_since)
@@ -579,20 +677,23 @@ async def count_assignments_by_course(
             """
             SELECT a.course, COUNT(*) FROM assignments a
             INNER JOIN user_completions uc ON a.id = uc.assignment_id AND uc.user_id = ?
-            WHERE 1=1
+            WHERE (a.visibility = 'public' OR a.owner_id = ?)
             """
         ]
+        params: list = [user_id, user_id]
     elif done == 0:
         query = [
             """
             SELECT a.course, COUNT(*) FROM assignments a
             LEFT JOIN user_completions uc ON a.id = uc.assignment_id AND uc.user_id = ?
             WHERE uc.id IS NULL
+              AND (a.visibility = 'public' OR a.owner_id = ?)
             """
         ]
+        params = [user_id, user_id]
     else:
-        query = ["SELECT a.course, COUNT(*) FROM assignments a WHERE 1=1"]
-    params: list = [] if done is None else [user_id]
+        query = ["SELECT a.course, COUNT(*) FROM assignments a WHERE (a.visibility = 'public' OR a.owner_id = ?)"]
+        params = [user_id]
     if created_since is not None:
         query.append("AND datetime(a.created_at) >= datetime(?)")
         params.append(created_since)
@@ -782,3 +883,49 @@ async def get_all_subscribers() -> dict[str, list[str]]:
             async for row in cursor:
                 result.setdefault(row[0], []).append(row[1])
     return result
+
+
+async def get_class_notify_subscribers() -> dict[str, list[str]]:
+    """Like get_all_subscribers but only users with notify_class=1."""
+    result: dict[str, list[str]] = {}
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT ucs.course_name, ucs.user_id FROM user_course_subscriptions ucs
+            INNER JOIN users u ON ucs.user_id = u.qq_id
+            WHERE u.role IN ('root', 'admin', 'user') AND ucs.notify_class = 1
+            ORDER BY ucs.course_name
+            """
+        ) as cursor:
+            async for row in cursor:
+                result.setdefault(row[0], []).append(row[1])
+    return result
+
+
+async def toggle_class_notify(user_id: str, course_name: str) -> bool | None:
+    """Toggle notify_class for a subscription. Returns new state, or None if not subscribed."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT notify_class FROM user_course_subscriptions WHERE user_id = ? AND course_name = ?",
+            (user_id, course_name),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        new_val = 0 if row[0] else 1
+        await db.execute(
+            "UPDATE user_course_subscriptions SET notify_class = ? WHERE user_id = ? AND course_name = ?",
+            (new_val, user_id, course_name),
+        )
+        await db.commit()
+        return bool(new_val)
+
+
+async def get_notify_courses(user_id: str) -> list[str]:
+    """Get course names where user has notify_class enabled."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT course_name FROM user_course_subscriptions WHERE user_id = ? AND notify_class = 1 ORDER BY course_name",
+            (user_id,),
+        ) as cursor:
+            return [row[0] async for row in cursor]

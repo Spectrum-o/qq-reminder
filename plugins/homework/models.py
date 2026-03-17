@@ -27,6 +27,8 @@ class AssignmentDraft:
     deadline: str
     source_type: str = SOURCE_MANUAL
     source_key: str | None = None
+    visibility: str = "public"
+    owner_id: str = ""
 
 
 @dataclass(frozen=True)

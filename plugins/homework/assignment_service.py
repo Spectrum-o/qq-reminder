@@ -13,10 +13,11 @@ from .database import (
     delete_assignment,
     delete_reminders_by_ref,
     get_all_approved_user_ids,
+    get_assignment,
     get_subscribers_for_course,
     get_subscriptions,
     is_assignment_done_by,
-    list_all_undone_assignments,
+    list_all_assignments,
     list_pending,
     list_undone_assignments,
     mark_done,
@@ -114,15 +115,26 @@ async def apply_assignment_sync_outcome(outcome: SyncOutcome) -> None:
         await delete_reminders_by_ref("homework", str(assignment_id))
 
 
-async def add_manual_assignment(course: str, description: str, deadline: str) -> int:
+async def add_manual_assignment(
+    course: str, description: str, deadline: str,
+    visibility: str = "public", owner_id: str = "",
+) -> int:
     draft = AssignmentDraft(
         course=course,
         description=description,
         deadline=deadline,
         source_type=SOURCE_MANUAL,
+        visibility=visibility,
+        owner_id=owner_id,
     )
     assignment_id = await create_assignment(draft)
-    await sync_homework_reminders(assignment_id, course, description, deadline)
+    if visibility == "private":
+        reminders = _build_homework_reminders(
+            assignment_id, course, description, deadline, owner_id
+        )
+        await sync_reminders("homework", str(assignment_id), reminders, owner_id)
+    else:
+        await sync_homework_reminders(assignment_id, course, description, deadline)
     return assignment_id
 
 
@@ -147,12 +159,17 @@ async def list_pending_message(user_id: str) -> str:
         except ValueError:
             time_left = ""
 
-        lines.append(f"  #{row['id']}  [{row['course']}] {row['description']}")
+        lines.append(f"  #{row['id']}  [{row['course']}] {row['description']}{' [私]' if row.get('visibility') == 'private' else ''}")
         lines.append(f"       截止: {row['deadline']}  ({time_left})")
     return "\n".join(lines)
 
 
 async def complete_assignment(user_id: str, assignment_id: int) -> bool:
+    assignment = await get_assignment(assignment_id)
+    if not assignment:
+        return False
+    if assignment.get("visibility") == "private" and assignment.get("owner_id") != user_id:
+        return False
     ok = await mark_done(user_id, assignment_id)
     if ok:
         await delete_reminders_by_ref("homework", str(assignment_id), user_id=user_id)
@@ -166,18 +183,41 @@ async def remove_assignment(assignment_id: int) -> bool:
     return ok
 
 
+async def remove_assignment_checked(
+    assignment_id: int, user_id: str, is_admin: bool
+) -> str | None:
+    """Delete with permission check. Returns None on success, error message on failure."""
+    assignment = await get_assignment(assignment_id)
+    if not assignment:
+        return f"未找到编号 #{assignment_id} 的作业"
+    if assignment.get("visibility") == "private":
+        if assignment.get("owner_id") != user_id:
+            return "你只能删除自己的私人作业"
+    else:
+        if not is_admin:
+            return "只有管理员可以删除公共作业"
+    ok = await remove_assignment(assignment_id)
+    if not ok:
+        return f"删除作业 #{assignment_id} 失败"
+    return None
+
+
 async def backfill_homework_reminders() -> None:
     """Called at startup. Regenerates homework reminders for all approved users."""
     user_ids = await get_all_approved_user_ids()
-    rows = await list_all_undone_assignments()
+    rows = await list_all_assignments()
     if not rows:
         return
 
     for user_id in user_ids:
         subscriptions = set(await get_subscriptions(user_id))
         for row in rows:
-            if row["course"] not in subscriptions:
-                continue
+            if row.get("visibility") == "private":
+                if row.get("owner_id") != user_id:
+                    continue
+            else:
+                if row["course"] not in subscriptions:
+                    continue
             if await is_assignment_done_by(user_id, row["id"]):
                 continue
             reminders = _build_homework_reminders(
