@@ -142,15 +142,15 @@ async def handle_llm_fallback(bot: Bot, event: PrivateMessageEvent):
     if sensitive_reply:
         await llm_fallback.finish(sensitive_reply)
 
-    public_reply = get_local_public_reply(text)
-    if public_reply:
-        await llm_fallback.finish(public_reply)
-
     user_id = str(event.user_id)
     role = await get_user_role(user_id)
     is_approved_user = role in (ROLE_ROOT, ROLE_ADMIN, ROLE_USER)
 
     if not is_approved_user:
+        public_reply = get_local_public_reply(text)
+        if public_reply:
+            await llm_fallback.finish(public_reply)
+
         preapproval_reply = get_preapproval_local_reply(text)
         if preapproval_reply:
             await llm_fallback.finish(preapproval_reply)
@@ -179,9 +179,8 @@ async def handle_llm_fallback(bot: Bot, event: PrivateMessageEvent):
     assignments_text = await list_pending_message(user_id)
     schedule_text = await format_today_schedule_for_user(user_id)
 
-    is_admin = role in (ROLE_ROOT, ROLE_ADMIN)
     reply = await llm_service.chat(
-        text, assignments_text, schedule_text, user_id=user_id, is_admin=is_admin
+        text, assignments_text, schedule_text, user_id=user_id, role=role
     )
     if reply:
         await llm_fallback.finish(reply)

@@ -32,7 +32,14 @@ from .database import (
 from .models import ReminderDraft, STORED_DATETIME_FORMAT
 from .public_info import PUBLIC_BOT_GUIDE
 from .time_parser import parse_natural_deadline
-from .user_service import subscribe_courses
+from .user_service import (
+    ROLE_ADMIN,
+    ROLE_ROOT,
+    ROLE_USER,
+    approve_user as approve_pending_user,
+    list_pending_users as list_pending_user_rows,
+    subscribe_courses,
+)
 
 # ── Shared async client (bypass system proxy) ────
 
@@ -165,6 +172,33 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_pending_users",
+            "description": "查看当前待审核的用户列表。仅管理员和 root 可用。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "approve_user",
+            "description": "审批一个待审核用户。管理员只能审批为普通用户；root 可以审批为普通用户或管理员。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "qq_id": {"type": "string", "description": "待审核用户的 QQ 号"},
+                    "role": {
+                        "type": "string",
+                        "description": "审批后的角色，只能是 user 或 admin。默认 user。",
+                        "enum": ["user", "admin"],
+                    },
+                },
+                "required": ["qq_id"],
+            },
+        },
+    },
 ]
 
 # ── JSON fallback prompt (when function calling is unavailable) ──
@@ -216,6 +250,15 @@ ACTION: {"action": "<动作名>", "args": {<参数>}}
 11. toggle_course_notify - 开启/关闭某课程的上课提醒（早上7:30+课前提醒）
     args: {"name": "课程名"}
 
+12. list_pending_users - 查看待审核用户（仅管理员和 root）
+    args: {}
+
+13. approve_user - 审批待审核用户
+    args: {"qq_id": "QQ号", "role": "user 或 admin，默认 user"}
+    权限说明:
+    - admin 只能审批为 user
+    - root 可以审批为 user 或 admin
+
 示例:
 用户: 明天下午3点提醒我开会
 回复: 好的，我帮你设置明天下午3点的开会提醒。
@@ -241,6 +284,14 @@ ACTION: {"action": "add_course", "args": {"name": "数据结构", "time_slots": 
 回复: 好的，已删除英语课。
 ACTION: {"action": "delete_course", "args": {"name": "英语"}}
 
+用户: 看一下待审核用户
+回复:
+ACTION: {"action": "list_pending_users", "args": {}}
+
+用户: 通过 123456789 的注册
+回复: 好的，已通过 123456789 的注册。
+ACTION: {"action": "approve_user", "args": {"qq_id": "123456789", "role": "user"}}
+
 重要: args 里的参数名必须严格使用上面列出的名称（如 title、remind_at、time_slots），不要用其他名称。
 
 如果不需要执行操作（纯聊天或回答问题），直接用自然语言回复即可，不要附 ACTION 行。
@@ -259,7 +310,11 @@ def _weekday_now() -> str:
     return ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][datetime.now().weekday()]
 
 
-def _build_system_prompt(context: str, use_json_fallback: bool, is_admin: bool) -> str:
+def _is_admin_or_above(role: str | None) -> bool:
+    return role in (ROLE_ROOT, ROLE_ADMIN)
+
+
+def _build_system_prompt(context: str, use_json_fallback: bool, role: str | None) -> str:
     now = datetime.now()
     prompt = (
         "你是一个作业和课程提醒助手。用户通过 QQ 私聊和你交流。\n"
@@ -271,8 +326,18 @@ def _build_system_prompt(context: str, use_json_fallback: bool, is_admin: bool) 
         "当用户要求设置提醒、完成作业等操作时，你必须通过 ACTION 执行，不能只口头回复。\n"
         f"\n当前时间: {now.strftime('%Y-%m-%d %H:%M')} {_weekday_now()}\n"
     )
-    if is_admin:
-        prompt += "\n当前用户是管理员，添加的作业为公共作业（所有订阅者可见），可以删除公共作业。\n"
+    if role == ROLE_ROOT:
+        prompt += (
+            "\n当前用户是 root，拥有管理员全部权限。"
+            "添加的作业为公共作业（所有订阅者可见），可以删除公共作业，"
+            "还可以查看待审核用户，并把待审核用户审批为普通用户或管理员。\n"
+        )
+    elif role == ROLE_ADMIN:
+        prompt += (
+            "\n当前用户是管理员，添加的作业为公共作业（所有订阅者可见），可以删除公共作业，"
+            "也可以查看待审核用户，并把待审核用户审批为普通用户。"
+            "管理员不能把别人审批为管理员。\n"
+        )
     else:
         prompt += "\n当前用户是普通用户，添加的作业为私人作业（仅自己可见），可以删除自己的私人作业。\n"
     if use_json_fallback:
@@ -337,7 +402,7 @@ async def chat(
     schedule_text: str,
     *,
     user_id: str = "",
-    is_admin: bool = False,
+    role: str | None = None,
 ) -> str:
     """Send user message to LLM, execute any tool calls, return final reply."""
     if not LLM_API_BASE:
@@ -347,17 +412,17 @@ async def chat(
 
     # JSON-in-text mode: works with all OpenAI-compatible APIs including
     # proxies that don't support function calling (e.g. SDU DeepSeek).
-    return await _try_json_fallback(user_message, context, user_id, is_admin)
+    return await _try_json_fallback(user_message, context, user_id, role)
 
 
 async def _try_json_fallback(
     user_message: str,
     context: str,
     user_id: str,
-    is_admin: bool,
+    role: str | None,
 ) -> str:
     """Fallback: ask LLM to embed actions as JSON in text response."""
-    system_prompt = _build_system_prompt(context, use_json_fallback=True, is_admin=is_admin)
+    system_prompt = _build_system_prompt(context, use_json_fallback=True, role=role)
     content = await _call_text_model(system_prompt, user_message)
     if not content:
         return ""
@@ -372,7 +437,7 @@ async def _try_json_fallback(
             action_name = action_data.get("action", "")
             action_args = action_data.get("args", {})
             logger.info(f"LLM ACTION: {action_name} args={action_args}")
-            result = await _execute_tool(action_name, action_args, user_id, is_admin)
+            result = await _execute_tool(action_name, action_args, user_id, role)
             return f"{display_text}\n{result}".strip() if display_text else result
         except (json.JSONDecodeError, KeyError) as exc:
             logger.warning(f"Failed to parse ACTION JSON: {exc}")
@@ -380,14 +445,14 @@ async def _try_json_fallback(
     return content
 
 
-async def _execute_tool(name: str, args: dict, user_id: str, is_admin: bool) -> str:
+async def _execute_tool(name: str, args: dict, user_id: str, role: str | None) -> str:
     try:
         if name == "add_assignment":
             try:
                 deadline_iso = parse_natural_deadline(args["deadline"])
             except ValueError:
                 return f"无法识别截止时间: {args['deadline']}"
-            visibility = "public" if is_admin else "private"
+            visibility = "public" if _is_admin_or_above(role) else "private"
             aid = await add_manual_assignment(
                 args["course"], args["description"], deadline_iso,
                 visibility=visibility, owner_id=user_id,
@@ -402,7 +467,7 @@ async def _execute_tool(name: str, args: dict, user_id: str, is_admin: bool) -> 
 
         if name == "delete_assignment":
             aid = int(args["assignment_id"])
-            error = await remove_assignment_checked(aid, user_id, is_admin)
+            error = await remove_assignment_checked(aid, user_id, _is_admin_or_above(role))
             return error if error else f"作业 #{aid} 已删除"
 
         if name == "list_assignments":
@@ -463,7 +528,7 @@ async def _execute_tool(name: str, args: dict, user_id: str, is_admin: bool) -> 
                     "课程时间格式错误，请使用标准格式 X-Y周 星期Z A-B；"
                     "多个时间段用分号分隔，例如 1-16周 星期一 3-4; 1-16周 星期三 5-6"
                 )
-            visibility = "public" if is_admin else "private"
+            visibility = "public" if _is_admin_or_above(role) else "private"
             result = add_custom_course(
                 name=course_name,
                 time_slots=time_slots,
@@ -485,7 +550,7 @@ async def _execute_tool(name: str, args: dict, user_id: str, is_admin: bool) -> 
             course_name = args.get("name", "")
             if not course_name:
                 return "请提供课程名"
-            ok = delete_custom_course(course_name, user_id, is_admin)
+            ok = delete_custom_course(course_name, user_id, _is_admin_or_above(role))
             if not ok:
                 return f"未找到可删除的课程: {course_name}"
             await delete_subscriptions_by_course(course_name)
@@ -504,6 +569,39 @@ async def _execute_tool(name: str, args: dict, user_id: str, is_admin: bool) -> 
             await _refresh_today_course_reminders()
             status = "开启" if result else "关闭"
             return f"已{status} {course_name} 的上课提醒"
+
+        if name == "list_pending_users":
+            if not _is_admin_or_above(role):
+                return "只有管理员或 root 可以查看待审核用户"
+            rows = await list_pending_user_rows()
+            if not rows:
+                return "没有待审核的用户"
+            lines = ["待审核用户:"]
+            for row in rows:
+                nickname = row.get("nickname") or "(无昵称)"
+                lines.append(f"  {row['qq_id']}  {nickname}")
+            return "\n".join(lines)
+
+        if name == "approve_user":
+            if not _is_admin_or_above(role):
+                return "只有管理员或 root 可以审批用户"
+
+            target_qq = str(args.get("qq_id", "")).strip()
+            if not re.fullmatch(r"\d+", target_qq):
+                return "请提供正确的 QQ 号"
+
+            target_role = str(args.get("role", ROLE_USER)).strip().lower() or ROLE_USER
+            if target_role not in (ROLE_USER, ROLE_ADMIN):
+                return "角色只能是 user 或 admin"
+            if target_role == ROLE_ADMIN and role != ROLE_ROOT:
+                return "只有 root 可以把用户审批为管理员"
+
+            ok = await approve_pending_user(target_qq, user_id, target_role)
+            if not ok:
+                return f"审核失败: 用户 {target_qq} 不存在或已审核"
+
+            role_label = "管理员" if target_role == ROLE_ADMIN else "用户"
+            return f"已通过 {target_qq} 的注册 (角色: {role_label})"
 
         return f"未知操作: {name}"
 

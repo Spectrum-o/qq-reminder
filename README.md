@@ -23,15 +23,24 @@
 
 ## 快速开始
 
-### 1. 安装依赖
+### 1. 启动脚本（推荐）
 
 ```bash
-python3 -m pip install -e .
+./start.sh
 ```
 
-### 2. 配置 `.env`
+`start.sh` 会自动：
 
-复制 `.env.example` 为 `.env`，修改你的 QQ 号：
+- 创建 `.venv`
+- 安装依赖
+- 首次运行时交互生成 `.env`
+- 最后执行 `python bot.py`
+
+如果你不想使用脚本，也可以按下面步骤手动配置并启动。
+
+### 2. 手动配置 `.env`（可选）
+
+如果你已经用 `./start.sh` 生成过 `.env`，这一节可以跳过。手动方式是复制 `.env.example` 为 `.env`，再修改你的 QQ 号：
 
 ```env
 DRIVER=~fastapi
@@ -41,13 +50,13 @@ SUPERUSERS=["YOUR_QQ_NUMBER"]
 COMMAND_START=["/"]
 COMMAND_SEP=["."]
 OWNER_QQ=YOUR_QQ_NUMBER
-DATA_REPO_DIR=../homework-reminder-private
+DATA_REPO_DIR=../qq-reminder-private
 ```
 
 说明：
 
 - `OWNER_QQ`：Bot 管理员（root）的 QQ 号，必须是纯数字。启动后自动成为 root 用户并订阅所有课程
-- `DATA_REPO_DIR`：私有数据仓库路径（可选）。如果同级目录存在 `homework-reminder-private`，无需填写，代码会自动发现
+- `DATA_REPO_DIR`：私有数据仓库路径（可选）。如果未填写，代码会自动查找同级目录 `<当前仓库目录名>-private`。例如当前仓库目录名是 `qq-reminder`，则默认查找 `../qq-reminder-private`
 
 ### 3. 准备数据文件
 
@@ -55,8 +64,8 @@ DATA_REPO_DIR=../homework-reminder-private
 
 ```text
 your-workspace/
-├── homework-reminder/           # 公开仓库（代码）
-└── homework-reminder-private/   # 私有仓库（数据）
+├── qq-reminder/              # 公开仓库（代码）
+└── qq-reminder-private/      # 私有仓库（数据）
     ├── config.json
     ├── course.txt
     ├── assignments.json
@@ -64,10 +73,12 @@ your-workspace/
     └── data/                    # 自动生成
 ```
 
+如果你的公开仓库目录名不是 `qq-reminder`，默认私有目录名也应改成 `<仓库目录名>-private`，或者直接在 `.env` 里显式设置 `DATA_REPO_DIR`。
+
 代码按以下顺序查找数据目录：
 
 1. 环境变量 `DATA_REPO_DIR`
-2. 同级目录 `../homework-reminder-private`
+2. 同级目录 `../<当前仓库目录名>-private`
 3. 当前项目根目录（fallback）
 
 示例文件在 [`examples/`](./examples) 下，可以直接拷贝到私有仓库修改。
@@ -85,18 +96,40 @@ your-workspace/
 ### 4. 启动
 
 ```bash
+./start.sh
+```
+
+`./start.sh` 已经会在最后启动 bot，本项目内不需要再额外执行其他“启动 bot”的命令。
+
+如果你想手动启动，也可以执行：
+
+```bash
 python3 bot.py
 ```
 
-在 OneBot V11 实现端中配置反向 WebSocket 连接：
+启动后保持这个终端不要关闭。默认监听 `.env` 中的 `HOST:PORT`，例如 `0.0.0.0:8080`。
+
+### 5. 登录 QQ / 接入 OneBot
+
+这个仓库本身不提供 QQ 登录界面。QQ 登录发生在 OneBot V11 实现端里，例如 NapCat 或 Lagrange。
+
+你需要：
+
+1. 单独启动 NapCat / Lagrange
+2. 在 NapCat / Lagrange 里登录 QQ
+3. 在 OneBot V11 实现端中配置反向 WebSocket 连接到本项目
+
+同机部署时，反向 WebSocket 一般配置为：
 
 ```text
 ws://127.0.0.1:8080/onebot/v11/ws
 ```
 
+如果 OneBot 实现端和本项目不在同一台机器或容器里，把 `127.0.0.1` 改成 bot 实际可访问的地址，并确保端口与 `.env` 中的 `PORT` 一致。
+
 连接成功后，`OWNER_QQ` 私信发送 `/help` 查看所有命令。新用户私聊 Bot 发送 `/register` 即可提交注册申请，进入 `pending` 待审核状态；管理员执行 `/approve` 审批后即可使用。
 
-### 5. 启用 LLM（可选）
+### 6. 启用 LLM（可选）
 
 在 `.env` 中添加 LLM 配置：
 
@@ -126,7 +159,7 @@ LLM_MODEL=deepseek-ai/DeepSeek-V3.2
 1. 新用户私聊 Bot 发送 `/register` → 注册为 `pending`，收到"等待审核"提示
 2. 管理员执行 `/approve` 查看待审核列表
 3. 管理员执行 `/approve <QQ号>` 审批通过
-4. 用户收到审批通过后即可使用所有功能，建议发送 `/subscribe all` 订阅全部课程
+4. 用户收到审批通过后即可使用所有功能，建议先发送 `/subscribe` 查看可选课程，再按需订阅
 
 ---
 
@@ -135,6 +168,8 @@ LLM_MODEL=deepseek-ai/DeepSeek-V3.2
 每个用户独立选择关注的课程。只有已订阅的课程才会出现在：
 
 - `/today` 今日课程
+- `/list` `/ls` `/作业` 待完成作业列表
+- `/stats` 作业统计
 - 作业提醒（只收到已订阅课程的作业提醒）
 - 上课提醒（需对已订阅课程额外开启 `/notify`）
 - 每日早报
@@ -258,7 +293,7 @@ LLM_MODEL=deepseek-ai/DeepSeek-V3.2
 你好
 ```
 
-LLM 会自动识别意图并执行对应操作。管理员可通过自然语言管理公共作业和公共课程；普通用户可以管理自己的私人作业、私人课程和个人提醒。未审批用户只能进行公开问答。
+LLM 会自动识别意图并执行对应操作。普通用户可以管理自己的私人作业、私人课程和个人提醒；管理员可通过自然语言管理公共作业、公共课程，并审批普通用户；root 额外可以通过自然语言授予管理员。未审批用户只能进行公开问答。
 
 ---
 
@@ -428,11 +463,12 @@ LLM 会自动识别意图并执行对应操作。管理员可通过自然语言�
 ## 目录结构
 
 ```text
-homework-reminder/
+qq-reminder/
 ├── LICENSE
 ├── README.md
 ├── .env.example
 ├── .gitignore
+├── start.sh                        # 一键启动脚本
 ├── bot.py                          # 入口
 ├── pyproject.toml                  # 依赖
 ├── examples/                       # 数据文件示例
@@ -466,13 +502,17 @@ homework-reminder/
 
 ## 常见问题
 
+### 在哪里登录 QQ
+
+不在这个仓库里登录。这个仓库只负责启动 NoneBot 服务；你需要在 NapCat、Lagrange 等 OneBot V11 实现端里登录 QQ，然后把反向 WebSocket 指到本项目，例如 `ws://127.0.0.1:8080/onebot/v11/ws`。
+
 ### 新用户私聊 Bot 没有反应
 
 新用户先私聊 Bot 发送 `/register` 提交注册申请，随后会进入 `pending` 状态。管理员执行 `/approve <QQ号>` 审批后才能使用。
 
 ### 审批后看不到作业
 
-审批通过后需要先订阅课程：发送 `/subscribe all` 订阅所有课程，或 `/subscribe <课程名>` 订阅指定课程。
+审批通过后需要先订阅课程：发送 `/subscribe` 查看可选课程，再用 `/subscribe <课程名>` 按需订阅。
 
 ### 改了 `assignments.json` 但作业编号变了
 

@@ -451,7 +451,7 @@ async def handle_approve(bot: Bot, event: PrivateMessageEvent, args: Message = C
                 message=(
                     f"你的注册已通过审核 (角色: {role_label})\n"
                     "发送 /help 查看所有功能\n"
-                    "发送 /subscribe all 订阅所有课程"
+                    "发送 /subscribe 查看可选课程并按需订阅"
                 ),
             )
         except Exception:
@@ -698,7 +698,7 @@ async def handle_register(bot: Bot, event: PrivateMessageEvent):
         await register_user(user_id, nickname=getattr(event.sender, "nickname", "") or "")
         await register_cmd.finish(
             "已提交注册申请，请等待管理员审核\n"
-            "审核通过后即可使用全部功能，建议发送 /subscribe all 订阅全部课程"
+            "审核通过后即可使用全部功能，可发送 /subscribe 查看可选课程并按需订阅"
         )
 
     if role == ROLE_PENDING:
@@ -731,7 +731,7 @@ async def handle_help(bot: Bot, event: PrivateMessageEvent):
     elif role == ROLE_PENDING:
         intro_lines.extend([
             "你已提交注册申请，请等待管理员审核",
-            "审核通过后即可使用全部功能，建议发送 /subscribe all 订阅全部课程",
+            "审核通过后即可使用全部功能，可发送 /subscribe 查看可选课程并按需订阅",
             "",
         ])
 
@@ -741,7 +741,7 @@ async def handle_help(bot: Bot, event: PrivateMessageEvent):
         "  /register 提交注册申请\n"
         "  /help     查看帮助说明\n"
         "  管理员使用 /approve 查看待审核用户并审批\n"
-        "  审核通过后建议发送 /subscribe all 订阅全部课程\n"
+        "  审核通过后可用 /subscribe 查看可选课程并按需订阅\n"
         "\n"
         "快捷操作 (免 / 前缀):\n"
         "  3       标记 #3 完成\n"

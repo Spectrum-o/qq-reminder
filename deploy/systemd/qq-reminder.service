@@ -1,0 +1,16 @@
+[Unit]
+Description=QQ Reminder Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=eng
+WorkingDirectory=/home/eng/Program/2026-Spring/qq-reminder/qq-reminder
+ExecStart=/home/eng/Program/2026-Spring/qq-reminder/qq-reminder/.venv/bin/python /home/eng/Program/2026-Spring/qq-reminder/qq-reminder/bot.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

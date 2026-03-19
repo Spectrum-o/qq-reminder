@@ -219,10 +219,21 @@ async def list_pending(user_id: str) -> list[dict]:
             FROM assignments a
             LEFT JOIN user_completions uc ON a.id = uc.assignment_id AND uc.user_id = ?
             WHERE uc.id IS NULL
-              AND (a.visibility = 'public' OR a.owner_id = ?)
+              AND (
+                    (a.visibility = 'private' AND a.owner_id = ?)
+                    OR (
+                        a.visibility = 'public'
+                        AND EXISTS (
+                            SELECT 1
+                            FROM user_course_subscriptions ucs
+                            WHERE ucs.user_id = ?
+                              AND ucs.course_name = a.course
+                        )
+                    )
+                  )
             ORDER BY datetime(a.deadline) ASC, a.id ASC
             """,
-            (user_id, user_id),
+            (user_id, user_id, user_id),
         ) as cursor:
             return [dict(row) async for row in cursor]
 
@@ -240,10 +251,21 @@ async def list_undone_assignments(
         FROM assignments a
         LEFT JOIN user_completions uc ON a.id = uc.assignment_id AND uc.user_id = ?
         WHERE uc.id IS NULL
-          AND (a.visibility = 'public' OR a.owner_id = ?)
+          AND (
+                (a.visibility = 'private' AND a.owner_id = ?)
+                OR (
+                    a.visibility = 'public'
+                    AND EXISTS (
+                        SELECT 1
+                        FROM user_course_subscriptions ucs
+                        WHERE ucs.user_id = ?
+                          AND ucs.course_name = a.course
+                    )
+                )
+              )
         """
     ]
-    params: list[str] = [user_id, user_id]
+    params: list[str] = [user_id, user_id, user_id]
 
     if source_type is not None:
         query.append("AND a.source_type = ?")
@@ -643,23 +665,61 @@ async def count_assignments(
             """
             SELECT COUNT(*) FROM assignments a
             INNER JOIN user_completions uc ON a.id = uc.assignment_id AND uc.user_id = ?
-            WHERE (a.visibility = 'public' OR a.owner_id = ?)
+            WHERE (
+                  (a.visibility = 'private' AND a.owner_id = ?)
+                  OR (
+                      a.visibility = 'public'
+                      AND EXISTS (
+                          SELECT 1
+                          FROM user_course_subscriptions ucs
+                          WHERE ucs.user_id = ?
+                            AND ucs.course_name = a.course
+                      )
+                  )
+            )
             """
         ]
-        params: list = [user_id, user_id]
+        params: list = [user_id, user_id, user_id]
     elif done == 0:
         query = [
             """
             SELECT COUNT(*) FROM assignments a
             LEFT JOIN user_completions uc ON a.id = uc.assignment_id AND uc.user_id = ?
             WHERE uc.id IS NULL
-              AND (a.visibility = 'public' OR a.owner_id = ?)
+              AND (
+                    (a.visibility = 'private' AND a.owner_id = ?)
+                    OR (
+                        a.visibility = 'public'
+                        AND EXISTS (
+                            SELECT 1
+                            FROM user_course_subscriptions ucs
+                            WHERE ucs.user_id = ?
+                              AND ucs.course_name = a.course
+                        )
+                    )
+              )
+            """
+        ]
+        params = [user_id, user_id, user_id]
+    else:
+        query = [
+            """
+            SELECT COUNT(*) FROM assignments a
+            WHERE (
+                  (a.visibility = 'private' AND a.owner_id = ?)
+                  OR (
+                      a.visibility = 'public'
+                      AND EXISTS (
+                          SELECT 1
+                          FROM user_course_subscriptions ucs
+                          WHERE ucs.user_id = ?
+                            AND ucs.course_name = a.course
+                      )
+                  )
+            )
             """
         ]
         params = [user_id, user_id]
-    else:
-        query = ["SELECT COUNT(*) FROM assignments a WHERE (a.visibility = 'public' OR a.owner_id = ?)"]
-        params = [user_id]
     if created_since is not None:
         query.append("AND datetime(a.created_at) >= datetime(?)")
         params.append(created_since)
@@ -677,23 +737,61 @@ async def count_assignments_by_course(
             """
             SELECT a.course, COUNT(*) FROM assignments a
             INNER JOIN user_completions uc ON a.id = uc.assignment_id AND uc.user_id = ?
-            WHERE (a.visibility = 'public' OR a.owner_id = ?)
+            WHERE (
+                  (a.visibility = 'private' AND a.owner_id = ?)
+                  OR (
+                      a.visibility = 'public'
+                      AND EXISTS (
+                          SELECT 1
+                          FROM user_course_subscriptions ucs
+                          WHERE ucs.user_id = ?
+                            AND ucs.course_name = a.course
+                      )
+                  )
+            )
             """
         ]
-        params: list = [user_id, user_id]
+        params: list = [user_id, user_id, user_id]
     elif done == 0:
         query = [
             """
             SELECT a.course, COUNT(*) FROM assignments a
             LEFT JOIN user_completions uc ON a.id = uc.assignment_id AND uc.user_id = ?
             WHERE uc.id IS NULL
-              AND (a.visibility = 'public' OR a.owner_id = ?)
+              AND (
+                    (a.visibility = 'private' AND a.owner_id = ?)
+                    OR (
+                        a.visibility = 'public'
+                        AND EXISTS (
+                            SELECT 1
+                            FROM user_course_subscriptions ucs
+                            WHERE ucs.user_id = ?
+                              AND ucs.course_name = a.course
+                        )
+                    )
+              )
+            """
+        ]
+        params = [user_id, user_id, user_id]
+    else:
+        query = [
+            """
+            SELECT a.course, COUNT(*) FROM assignments a
+            WHERE (
+                  (a.visibility = 'private' AND a.owner_id = ?)
+                  OR (
+                      a.visibility = 'public'
+                      AND EXISTS (
+                          SELECT 1
+                          FROM user_course_subscriptions ucs
+                          WHERE ucs.user_id = ?
+                            AND ucs.course_name = a.course
+                      )
+                  )
+            )
             """
         ]
         params = [user_id, user_id]
-    else:
-        query = ["SELECT a.course, COUNT(*) FROM assignments a WHERE (a.visibility = 'public' OR a.owner_id = ?)"]
-        params = [user_id]
     if created_since is not None:
         query.append("AND datetime(a.created_at) >= datetime(?)")
         params.append(created_since)

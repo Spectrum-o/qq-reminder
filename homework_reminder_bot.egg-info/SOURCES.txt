@@ -19,6 +19,7 @@ plugins/homework/llm_handler.py
 plugins/homework/llm_service.py
 plugins/homework/models.py
 plugins/homework/paths.py
+plugins/homework/public_info.py
 plugins/homework/recurring_service.py
 plugins/homework/reminder_engine.py
 plugins/homework/scheduler.py

@@ -168,8 +168,13 @@ async def complete_assignment(user_id: str, assignment_id: int) -> bool:
     assignment = await get_assignment(assignment_id)
     if not assignment:
         return False
-    if assignment.get("visibility") == "private" and assignment.get("owner_id") != user_id:
-        return False
+    if assignment.get("visibility") == "private":
+        if assignment.get("owner_id") != user_id:
+            return False
+    else:
+        subscriptions = set(await get_subscriptions(user_id))
+        if assignment["course"] not in subscriptions:
+            return False
     ok = await mark_done(user_id, assignment_id)
     if ok:
         await delete_reminders_by_ref("homework", str(assignment_id), user_id=user_id)
