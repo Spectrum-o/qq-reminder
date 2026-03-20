@@ -118,6 +118,11 @@ async def init_db() -> None:
         await _ensure_column(db, "assignments", "visibility", "TEXT NOT NULL DEFAULT 'public'")
         await _ensure_column(db, "assignments", "owner_id", "TEXT NOT NULL DEFAULT ''")
 
+        # ── Briefing time preferences ──
+        await _ensure_column(db, "users", "briefing_enabled", "INTEGER NOT NULL DEFAULT 1")
+        await _ensure_column(db, "users", "briefing_hour", "INTEGER NOT NULL DEFAULT 8")
+        await _ensure_column(db, "users", "briefing_minute", "INTEGER NOT NULL DEFAULT 0")
+
         # ── Data migration (single-user → multi-user) ──
 
         from .config import OWNER_QQ
@@ -567,42 +572,127 @@ def _escape_like_pattern(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-async def delete_subscriptions_by_course(course_name: str) -> int:
+async def delete_subscriptions_by_course(
+    course_name: str, *, user_id: str | None = None
+) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "DELETE FROM user_course_subscriptions WHERE course_name = ?",
-            (course_name,),
-        )
+        if user_id is None:
+            cursor = await db.execute(
+                "DELETE FROM user_course_subscriptions WHERE course_name = ?",
+                (course_name,),
+            )
+        else:
+            cursor = await db.execute(
+                "DELETE FROM user_course_subscriptions WHERE course_name = ? AND user_id = ?",
+                (course_name, user_id),
+            )
         await db.commit()
         return cursor.rowcount
 
 
-async def delete_reminders_by_course(course_name: str) -> int:
+async def delete_reminders_by_course(
+    course_name: str,
+    *,
+    visibility: str | None = None,
+    owner_id: str | None = None,
+) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
         # Course-type reminders: ref_id format is "{course}@{date}@{period}"
         course_ref_prefix = f"{_escape_like_pattern(course_name)}@%"
-        c1 = await db.execute(
-            "DELETE FROM reminders WHERE sent = 0 AND type = 'course' AND ref_id LIKE ? ESCAPE '\\'",
-            (course_ref_prefix,),
-        )
-        # Homework-type reminders: ref_id is assignment ID as text
-        c2 = await db.execute(
-            """
-            DELETE FROM reminders WHERE sent = 0 AND type = 'homework' AND ref_id IN (
-                SELECT CAST(id AS TEXT) FROM assignments WHERE course = ?
+        if visibility == "private":
+            if not owner_id:
+                raise ValueError("owner_id is required when deleting private course reminders")
+            c1 = await db.execute(
+                """
+                DELETE FROM reminders
+                WHERE sent = 0
+                  AND type = 'course'
+                  AND user_id = ?
+                  AND ref_id LIKE ? ESCAPE '\\'
+                """,
+                (owner_id, course_ref_prefix),
             )
-            """,
-            (course_name,),
-        )
+            c2 = await db.execute(
+                """
+                DELETE FROM reminders
+                WHERE sent = 0
+                  AND type = 'homework'
+                  AND user_id = ?
+                  AND ref_id IN (
+                      SELECT CAST(id AS TEXT)
+                      FROM assignments
+                      WHERE course = ?
+                        AND visibility = 'private'
+                        AND owner_id = ?
+                  )
+                """,
+                (owner_id, course_name, owner_id),
+            )
+        elif visibility == "public":
+            c1 = await db.execute(
+                "DELETE FROM reminders WHERE sent = 0 AND type = 'course' AND ref_id LIKE ? ESCAPE '\\'",
+                (course_ref_prefix,),
+            )
+            c2 = await db.execute(
+                """
+                DELETE FROM reminders
+                WHERE sent = 0
+                  AND type = 'homework'
+                  AND ref_id IN (
+                      SELECT CAST(id AS TEXT)
+                      FROM assignments
+                      WHERE course = ?
+                        AND visibility = 'public'
+                  )
+                """,
+                (course_name,),
+            )
+        else:
+            c1 = await db.execute(
+                "DELETE FROM reminders WHERE sent = 0 AND type = 'course' AND ref_id LIKE ? ESCAPE '\\'",
+                (course_ref_prefix,),
+            )
+            c2 = await db.execute(
+                """
+                DELETE FROM reminders WHERE sent = 0 AND type = 'homework' AND ref_id IN (
+                    SELECT CAST(id AS TEXT) FROM assignments WHERE course = ?
+                )
+                """,
+                (course_name,),
+            )
         await db.commit()
         return c1.rowcount + c2.rowcount
 
 
-async def delete_assignments_by_course(course_name: str) -> int:
+async def delete_assignments_by_course(
+    course_name: str,
+    *,
+    visibility: str | None = None,
+    owner_id: str | None = None,
+) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT id FROM assignments WHERE course = ?", (course_name,)
-        )
+        if visibility == "private":
+            if not owner_id:
+                raise ValueError("owner_id is required when deleting private course assignments")
+            cursor = await db.execute(
+                """
+                SELECT id FROM assignments
+                WHERE course = ? AND visibility = 'private' AND owner_id = ?
+                """,
+                (course_name, owner_id),
+            )
+        elif visibility == "public":
+            cursor = await db.execute(
+                """
+                SELECT id FROM assignments
+                WHERE course = ? AND visibility = 'public'
+                """,
+                (course_name,),
+            )
+        else:
+            cursor = await db.execute(
+                "SELECT id FROM assignments WHERE course = ?", (course_name,)
+            )
         ids = [row[0] async for row in cursor]
         if ids:
             placeholders = ",".join("?" for _ in ids)
@@ -636,6 +726,7 @@ async def delete_homework_reminders_for_user_courses(
                   SELECT CAST(id AS TEXT)
                   FROM assignments
                   WHERE course IN ({placeholders})
+                    AND visibility = 'public'
               )
             """,
             [user_id, *course_names],
@@ -893,11 +984,48 @@ async def list_users(role: str | None = None) -> list[dict]:
 
 
 async def delete_user(qq_id: str) -> bool:
+    from .course_parser import delete_private_custom_courses_by_owner
+
     async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT role FROM users WHERE qq_id = ?", (qq_id,)) as cursor:
+            row = await cursor.fetchone()
+        if row is None or row[0] == "root":
+            return False
+
+        delete_private_custom_courses_by_owner(qq_id)
         cursor = await db.execute("DELETE FROM users WHERE qq_id = ?", (qq_id,))
+        assignment_cursor = await db.execute(
+            """
+            SELECT id FROM assignments
+            WHERE visibility = 'private' AND owner_id = ?
+            """,
+            (qq_id,),
+        )
+        assignment_ids = [row[0] async for row in assignment_cursor]
+
+        if assignment_ids:
+            placeholders = ",".join("?" for _ in assignment_ids)
+            assignment_ref_ids = [str(assignment_id) for assignment_id in assignment_ids]
+            reminder_placeholders = ",".join("?" for _ in assignment_ref_ids)
+            await db.execute(
+                f"DELETE FROM user_completions WHERE assignment_id IN ({placeholders})",
+                assignment_ids,
+            )
+            await db.execute(
+                f"""
+                DELETE FROM reminders
+                WHERE type = 'homework' AND ref_id IN ({reminder_placeholders})
+                """,
+                assignment_ref_ids,
+            )
+            await db.execute(
+                f"DELETE FROM assignments WHERE id IN ({placeholders})",
+                assignment_ids,
+            )
+
         await db.execute("DELETE FROM user_completions WHERE user_id = ?", (qq_id,))
         await db.execute("DELETE FROM user_course_subscriptions WHERE user_id = ?", (qq_id,))
-        await db.execute("DELETE FROM reminders WHERE user_id = ? AND sent = 0", (qq_id,))
+        await db.execute("DELETE FROM reminders WHERE user_id = ?", (qq_id,))
         await db.commit()
         return cursor.rowcount > 0
 
@@ -908,6 +1036,52 @@ async def get_all_approved_user_ids() -> list[str]:
             "SELECT qq_id FROM users WHERE role IN ('root', 'admin', 'user')"
         ) as cursor:
             return [row[0] async for row in cursor]
+
+
+async def get_users_for_briefing_time(hour: int, minute: int) -> list[str]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT qq_id FROM users
+            WHERE role IN ('root', 'admin', 'user')
+              AND briefing_enabled = 1
+              AND briefing_hour = ?
+              AND briefing_minute = ?
+            """,
+            (hour, minute),
+        ) as cursor:
+            return [row[0] async for row in cursor]
+
+
+async def get_briefing_settings(qq_id: str) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT briefing_enabled, briefing_hour, briefing_minute FROM users WHERE qq_id = ?",
+            (qq_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+
+async def set_briefing_time(qq_id: str, hour: int, minute: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE users SET briefing_hour = ?, briefing_minute = ?, briefing_enabled = 1 WHERE qq_id = ?",
+            (hour, minute, qq_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def set_briefing_enabled(qq_id: str, enabled: bool) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE users SET briefing_enabled = ? WHERE qq_id = ?",
+            (1 if enabled else 0, qq_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
 
 
 # ── Course subscription CRUD ─────────────────────────

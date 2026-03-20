@@ -10,7 +10,7 @@ from nonebot_plugin_apscheduler import scheduler  # noqa: E402
 
 from .config import OWNER_QQ  # noqa: E402
 from .course_reminder import get_today_schedule_for_user  # noqa: E402
-from .database import get_all_approved_user_ids, list_pending, list_pending_custom_reminders  # noqa: E402
+from .database import get_users_for_briefing_time, list_pending, list_pending_custom_reminders  # noqa: E402
 from .models import STORED_DATETIME_FORMAT  # noqa: E402
 
 WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
@@ -91,15 +91,20 @@ async def build_daily_briefing(user_id: str) -> str:
     return "\n".join(lines)
 
 
-@scheduler.scheduled_job("cron", hour=8, minute=0, id="daily_briefing")
-async def daily_briefing_job():
+@scheduler.scheduled_job("cron", minute="*", id="daily_briefing_dispatch")
+async def daily_briefing_dispatch():
+    """Every minute, check if any user's briefing time matches and send."""
+    now = datetime.now()
+    user_ids = await get_users_for_briefing_time(now.hour, now.minute)
+    if not user_ids:
+        return
+
     try:
         bot = get_bot()
     except ValueError:
         logger.warning("Daily briefing skipped: no bot connected")
         return
 
-    user_ids = await get_all_approved_user_ids()
     for user_id in user_ids:
         try:
             msg = await build_daily_briefing(user_id)

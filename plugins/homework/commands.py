@@ -16,6 +16,7 @@ from .assignment_service import (
     remove_assignment_checked,
     sync_homework_reminders_for_user,
 )
+from .agenda_service import build_agenda_message
 from .course_parser import (
     parse_courses,
     get_all_courses,
@@ -32,8 +33,11 @@ from .database import (
     delete_reminder,
     delete_reminders_by_course,
     delete_subscriptions_by_course,
+    get_briefing_settings,
     get_notify_courses,
     list_pending_custom_reminders,
+    set_briefing_enabled,
+    set_briefing_time,
     toggle_class_notify,
 )
 from .models import ReminderDraft, STORED_DATETIME_FORMAT
@@ -78,6 +82,14 @@ async def _check_admin(event: PrivateMessageEvent) -> str | None:
     return None
 
 
+async def _check_root(event: PrivateMessageEvent) -> str | None:
+    """Returns user_id if root, or None."""
+    user_id = str(event.user_id)
+    if await is_root(user_id):
+        return user_id
+    return None
+
+
 async def _refresh_today_course_reminders() -> None:
     from .course_reminder import generate_course_reminders_for_date
 
@@ -90,6 +102,7 @@ _PENDING_MSG = (
     "如已申请，请等待管理员审核"
 )
 _ADMIN_ONLY_MSG = "只有管理员可以执行此操作"
+_ROOT_ONLY_MSG = "只有 root 可以执行此操作"
 
 
 # ── 免前缀快捷操作 ────────────────────────────────
@@ -221,6 +234,20 @@ async def handle_list(bot: Bot, event: PrivateMessageEvent):
     await list_cmd.finish(await list_pending_message(user_id))
 
 
+# ── /agenda ───────────────────────────────────────
+agenda_cmd = on_command(
+    "agenda", aliases={"待办", "事项", "总览"}, priority=10, block=True
+)
+
+
+@agenda_cmd.handle()
+async def handle_agenda(bot: Bot, event: PrivateMessageEvent):
+    user_id = await _check_user(event)
+    if not user_id:
+        await agenda_cmd.finish(_PENDING_MSG)
+    await agenda_cmd.finish(await build_agenda_message(user_id))
+
+
 # ── /done ─────────────────────────────────────────
 done_cmd = on_command("done", aliases={"完成"}, priority=10, block=True)
 
@@ -318,6 +345,67 @@ async def handle_briefing(bot: Bot, event: PrivateMessageEvent):
     if not user_id:
         await briefing_cmd.finish(_PENDING_MSG)
     await briefing_cmd.finish(await build_daily_briefing(user_id))
+
+
+# ── /briefing_time ──────────────────────────────────
+briefing_time_cmd = on_command("briefing_time", aliases={"早报时间"}, priority=10, block=True)
+
+
+@briefing_time_cmd.handle()
+async def handle_briefing_time(bot: Bot, event: PrivateMessageEvent, args: Message = CommandArg()):
+    user_id = await _check_user(event)
+    if not user_id:
+        await briefing_time_cmd.finish(_PENDING_MSG)
+
+    text = args.extract_plain_text().strip()
+
+    if not text:
+        settings = await get_briefing_settings(user_id)
+        if settings is None:
+            await briefing_time_cmd.finish("用户不存在")
+        enabled = settings["briefing_enabled"]
+        hour = settings["briefing_hour"]
+        minute = settings["briefing_minute"]
+        status = "开启" if enabled else "关闭"
+        await briefing_time_cmd.finish(
+            f"当前早报设置:\n"
+            f"  状态: {status}\n"
+            f"  时间: {hour:02d}:{minute:02d}\n"
+            f"\n"
+            f"使用: /briefing_time <HH:MM>  设置时间\n"
+            f"使用: /briefing_time off      关闭早报\n"
+            f"使用: /briefing_time on       开启早报"
+        )
+
+    if text.lower() == "off":
+        await set_briefing_enabled(user_id, False)
+        await briefing_time_cmd.finish("已关闭每日早报")
+
+    if text.lower() == "on":
+        await set_briefing_enabled(user_id, True)
+        settings = await get_briefing_settings(user_id)
+        hour = settings["briefing_hour"]
+        minute = settings["briefing_minute"]
+        await briefing_time_cmd.finish(f"已开启每日早报 (时间: {hour:02d}:{minute:02d})")
+
+    # Parse HH:MM
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
+    if not m:
+        await briefing_time_cmd.finish(
+            "格式错误\n"
+            "使用: /briefing_time <HH:MM>\n"
+            "例: /briefing_time 7:30\n"
+            "    /briefing_time off  关闭早报\n"
+            "    /briefing_time on   开启早报"
+        )
+
+    hour = int(m.group(1))
+    minute = int(m.group(2))
+    if hour > 23 or minute > 59:
+        await briefing_time_cmd.finish("时间无效，请使用 0:00 ~ 23:59")
+
+    await set_briefing_time(user_id, hour, minute)
+    await briefing_time_cmd.finish(f"已设置每日早报时间为 {hour:02d}:{minute:02d}")
 
 
 # ── /remind ──────────────────────────────────────
@@ -451,6 +539,7 @@ async def handle_approve(bot: Bot, event: PrivateMessageEvent, args: Message = C
                 message=(
                     f"你的注册已通过审核 (角色: {role_label})\n"
                     "发送 /help 查看所有功能\n"
+                    "发送 /agenda 查看事项总览\n"
                     "发送 /subscribe 查看可选课程并按需订阅"
                 ),
             )
@@ -467,9 +556,9 @@ users_cmd = on_command("users", aliases={"用户列表"}, priority=10, block=Tru
 
 @users_cmd.handle()
 async def handle_users(bot: Bot, event: PrivateMessageEvent):
-    admin_id = await _check_admin(event)
-    if not admin_id:
-        await users_cmd.finish(_ADMIN_ONLY_MSG)
+    root_id = await _check_root(event)
+    if not root_id:
+        await users_cmd.finish(_ROOT_ONLY_MSG)
     users = await list_all_users()
     if not users:
         await users_cmd.finish("没有用户")
@@ -581,7 +670,7 @@ async def handle_addcourse(bot: Bot, event: PrivateMessageEvent, args: Message =
             "    /addcourse 英语 1-18周 星期三 5-6\n"
             "    /addcourse 英语 1-18周 星期三 5-6; 1-18周 星期五 1-2\n"
             "\n管理员添加为公共课程，普通用户添加为私人课程\n"
-            "课程名当前全局唯一，不能与现有课程重名"
+            "公共课程名全局唯一；私人课程名仅对自己唯一，但不能与公共课程重名"
         )
 
     name, time_slots = parts
@@ -605,7 +694,8 @@ async def handle_addcourse(bot: Bot, event: PrivateMessageEvent, args: Message =
     if entry is None:
         await addcourse_cmd.finish(
             f"课程 {name} 已存在，无法重复添加\n"
-            "当前课程名全局唯一，不能与现有公共或私人课程重名"
+            "公共课程名必须全局唯一；私人课程名只需要对自己唯一，"
+            "但不能与现有公共课程重名"
         )
 
     # Auto-subscribe creator
@@ -636,17 +726,22 @@ async def handle_delcourse(bot: Bot, event: PrivateMessageEvent, args: Message =
         await delcourse_cmd.finish("格式: /delcourse <课程名>\n例: /delcourse 高等数学")
 
     is_admin = await is_admin_or_above(user_id)
-    ok = delete_custom_course(name, user_id, is_admin)
-    if not ok:
+    deleted = delete_custom_course(name, user_id, is_admin)
+    if not deleted:
         await delcourse_cmd.finish(
             f"未找到可删除的课程: {name}\n"
             "管理员可删除公共课程，普通用户只能删除自己的私人课程"
         )
 
     # Cascade cleanup
-    await delete_subscriptions_by_course(name)
-    await delete_reminders_by_course(name)
-    await delete_assignments_by_course(name)
+    if deleted.get("visibility") == "private":
+        await delete_subscriptions_by_course(name, user_id=user_id)
+        await delete_reminders_by_course(name, visibility="private", owner_id=user_id)
+        await delete_assignments_by_course(name, visibility="private", owner_id=user_id)
+    else:
+        await delete_subscriptions_by_course(name)
+        await delete_reminders_by_course(name, visibility="public")
+        await delete_assignments_by_course(name, visibility="public")
     await _refresh_today_course_reminders()
 
     await delcourse_cmd.finish(f"已删除课程: {name}\n已清理相关订阅、提醒和作业")
@@ -698,7 +793,8 @@ async def handle_register(bot: Bot, event: PrivateMessageEvent):
         await register_user(user_id, nickname=getattr(event.sender, "nickname", "") or "")
         await register_cmd.finish(
             "已提交注册申请，请等待管理员审核\n"
-            "审核通过后即可使用全部功能，可发送 /subscribe 查看可选课程并按需订阅"
+            "审核通过后即可使用全部功能，可发送 /agenda 查看事项总览，"
+            "再发送 /subscribe 查看可选课程并按需订阅"
         )
 
     if role == ROLE_PENDING:
@@ -709,7 +805,8 @@ async def handle_register(bot: Bot, event: PrivateMessageEvent):
 
     await register_cmd.finish(
         "你已经通过审核，可以直接使用全部功能\n"
-        "发送 /help 查看功能说明"
+        "发送 /help 查看功能说明\n"
+        "发送 /agenda 查看事项总览"
     )
 
 
@@ -731,7 +828,8 @@ async def handle_help(bot: Bot, event: PrivateMessageEvent):
     elif role == ROLE_PENDING:
         intro_lines.extend([
             "你已提交注册申请，请等待管理员审核",
-            "审核通过后即可使用全部功能，可发送 /subscribe 查看可选课程并按需订阅",
+            "审核通过后即可使用全部功能，可发送 /agenda 查看事项总览，"
+            "再发送 /subscribe 查看可选课程并按需订阅",
             "",
         ])
 
@@ -741,7 +839,8 @@ async def handle_help(bot: Bot, event: PrivateMessageEvent):
         "  /register 提交注册申请\n"
         "  /help     查看帮助说明\n"
         "  管理员使用 /approve 查看待审核用户并审批\n"
-        "  审核通过后可用 /subscribe 查看可选课程并按需订阅\n"
+        "  审核通过后可用 /agenda 查看事项总览，再用 /subscribe 按需订阅课程\n"
+        "  这个 bot 的核心是把课程、作业和个人待办都当作可提醒事项来管理\n"
         "\n"
         "快捷操作 (免 / 前缀):\n"
         "  3       标记 #3 完成\n"
@@ -756,6 +855,7 @@ async def handle_help(bot: Bot, event: PrivateMessageEvent):
         "  /delete <编号>  删除作业\n"
         "    管理员删公共, 用户删自己的私人\n"
         "  /list           查看作业\n"
+        "  /agenda         统一查看课程+作业+提醒\n"
         "\n"
         "提醒:\n"
         "  /remind <时间> <内容>  设置提醒\n"
@@ -765,7 +865,8 @@ async def handle_help(bot: Bot, event: PrivateMessageEvent):
         "课程管理:\n"
         "  /addcourse <名> <时间>  添加课程\n"
         "    管理员=公共, 用户=私人\n"
-        "    课程名全局唯一, 时间格式: X-Y周 星期Z A-B\n"
+        "    公共课程名全局唯一, 私人课程名仅对自己唯一\n"
+        "    时间格式: X-Y周 星期Z A-B\n"
         "  /delcourse <课程名>     删除课程\n"
         "  /notify [课程名]        开关上课提醒\n"
         "    早上7:30 + 课前提醒\n"
@@ -775,16 +876,20 @@ async def handle_help(bot: Bot, event: PrivateMessageEvent):
         "  /unsubscribe <课程名>   退订课程\n"
         "  /mycourses              我的课程\n"
         "\n"
-        "课程 & 其他:\n"
+        "课程 & 总览:\n"
         "  /today    今日课程\n"
         "  /courses  学期课表\n"
+        "  /agenda   事项总览\n"
         "  /stats    作业统计\n"
         "  /briefing 每日早报\n"
+        "  /briefing_time [HH:MM|off|on] 设置早报时间或开关\n"
         "  /rules    周期性作业规则\n"
         "  /help     显示此帮助\n"
         "\n"
-        "用户管理 (管理员):\n"
+        "用户管理:\n"
         "  /approve [QQ号]  审核用户\n"
-        "  /users           用户列表"
+        "    管理员和 root 可用\n"
+        "  /users           用户列表\n"
+        "    仅 root 可用"
     )
     await help_cmd.finish(msg)

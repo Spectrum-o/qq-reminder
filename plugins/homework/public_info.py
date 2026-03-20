@@ -5,27 +5,29 @@ import re
 PUBLIC_BOT_GUIDE = """
 项目简介:
 - 这是一个开源 QQ Reminder Bot，基于 NoneBot2 + OneBot V11。
-- 主要功能包括注册审批、课程订阅、作业管理、个人提醒、今日课程、上课提醒、每日早报和自然语言交互。
+- 核心目标是把课程、作业和个人待办都当作可提醒事项来管理。
+- 主要功能包括注册审批、课程订阅、事项管理、个人提醒、今日课程、上课提醒、每日早报和自然语言交互。
 
 注册与使用:
 - 新用户私聊机器人发送 /register 即可提交注册申请，进入待审核状态。
-- 管理员审批通过后即可使用全部功能，可发送 /subscribe 查看可选课程并按需订阅。
+- 管理员审批通过后即可使用全部功能，可先发送 /agenda 查看事项总览，再发送 /subscribe 查看可选课程并按需订阅。
 - 机器人不会公开管理员身份、QQ 号或审批名单。
-- 自定义课程名当前全局唯一，不能与现有公共或私人课程重名。
+- 公共课程名全局唯一；私人课程名仅对自己唯一，可与其他用户重名，但不能与公共课程重名。
 
 常用命令:
 - /register 提交注册申请
 - /help 查看帮助和注册方式
 - /subscribe /unsubscribe /mycourses 管理课程订阅
-- /list /add /done /delete /stats /rules 管理作业
+- /agenda 查看统一事项总览
+- /list /add /done /delete /stats /rules 管理作业型事项
 - /remind /reminders /cancel 管理个人提醒
 - /today /courses /briefing /notify 查看课程和提醒
-- /approve /users 是管理员命令
+- /approve 是管理员命令；/users 仅 root 可用
 
 自然语言:
-- 审批通过后，可以直接用自然语言添加/删除自己的作业、设置提醒、查看作业和课程。
-- 管理员还可以通过自然语言管理公共作业和公共课程。
-- 管理员还可以通过自然语言查看待审核用户并审批普通用户；root 还可以通过自然语言授予管理员。
+- 审批通过后，可以直接用自然语言查看事项、添加作业型事项、设置提醒、查看课程。
+- 管理员还可以通过自然语言管理公共作业型事项和公共课程。
+- 管理员还可以通过自然语言查看待审核用户并审批普通用户；root 还可以通过自然语言查看所有用户及其角色，并授予管理员。
 - 未审批用户可以询问公开功能和使用方式，但不能执行个人操作。
 
 公开技术信息:
@@ -41,7 +43,32 @@ SENSITIVE_REPLY = (
 
 PREAPPROVAL_REPLY = (
     "这些个人功能需要先注册并通过审核。请先私聊发送 /register 提交注册申请，"
-    "审核通过后就可以添加作业、设置提醒和查看个人数据。"
+    "审核通过后就可以管理事项、设置提醒和查看个人数据。"
+)
+
+_USER_LIST_QUERY_NEEDLES = (
+    "待审核用户",
+    "审批列表",
+    "pending用户",
+    "用户列表",
+    "所有用户",
+    "注册名单",
+    "谁注册了",
+    "有哪些用户",
+)
+
+_PENDING_USER_LIST_QUERY_NEEDLES = (
+    "待审核用户",
+    "审批列表",
+    "pending用户",
+)
+
+_ALL_USER_LIST_QUERY_NEEDLES = (
+    "用户列表",
+    "所有用户",
+    "注册名单",
+    "谁注册了",
+    "有哪些用户",
 )
 
 
@@ -51,6 +78,27 @@ def _compact(text: str) -> str:
 
 def _contains_any(text: str, needles: tuple[str, ...]) -> bool:
     return any(needle in text for needle in needles)
+
+
+def is_user_list_query(text: str) -> bool:
+    compact = _compact(text)
+    if not compact:
+        return False
+    return _contains_any(compact, _USER_LIST_QUERY_NEEDLES)
+
+
+def is_pending_user_list_query(text: str) -> bool:
+    compact = _compact(text)
+    if not compact:
+        return False
+    return _contains_any(compact, _PENDING_USER_LIST_QUERY_NEEDLES)
+
+
+def is_all_user_list_query(text: str) -> bool:
+    compact = _compact(text)
+    if not compact:
+        return False
+    return _contains_any(compact, _ALL_USER_LIST_QUERY_NEEDLES)
 
 
 def get_sensitive_query_reply(text: str) -> str | None:
@@ -78,19 +126,7 @@ def get_sensitive_query_reply(text: str) -> str | None:
     ):
         return SENSITIVE_REPLY
 
-    if _contains_any(
-        compact,
-        (
-            "待审核用户",
-            "审批列表",
-            "pending用户",
-            "用户列表",
-            "所有用户",
-            "注册名单",
-            "谁注册了",
-            "有哪些用户",
-        ),
-    ):
+    if is_user_list_query(text):
         return SENSITIVE_REPLY
 
     if _contains_any(
@@ -170,8 +206,8 @@ def get_local_public_reply(text: str) -> str | None:
         ),
     ):
         return (
-            "这个 bot 是一个开源 QQ 提醒机器人，支持注册审批、课程订阅、作业管理、"
-            "个人提醒、今日课程、上课提醒、每日早报，以及自然语言交互。"
+            "这个 bot 是一个开源 QQ 提醒机器人，核心是把课程、作业和个人待办都变成可提醒事项。"
+            "它支持注册审批、课程订阅、事项管理、个人提醒、今日课程、上课提醒、每日早报，以及自然语言交互。"
         )
 
     if _contains_any(
@@ -189,7 +225,8 @@ def get_local_public_reply(text: str) -> str | None:
     ):
         return (
             "新用户私聊发送 /register 就会提交注册申请，进入待审核状态。"
-            "管理员审批通过后即可使用全部功能，可再发送 /subscribe 查看可选课程并按需订阅。"
+            "管理员审批通过后即可使用全部功能，可先发送 /agenda 查看事项总览，"
+            "再发送 /subscribe 查看可选课程并按需订阅。"
         )
 
     if _contains_any(
@@ -205,8 +242,8 @@ def get_local_public_reply(text: str) -> str | None:
     ):
         return (
             "注册后需要管理员审批。管理员可以用 /approve 查看待审核用户并审批，"
-            "也可以用 /users 查看用户列表。审批通过后，管理员还可以通过自然语言查看待审核用户并审批普通用户；"
-            "root 还可以通过自然语言授予管理员。机器人不会公开管理员身份信息。"
+            "root 可以用 /users 查看用户列表。审批通过后，管理员还可以通过自然语言查看待审核用户并审批普通用户；"
+            "root 还可以通过自然语言查看所有用户及其角色，并授予管理员。机器人不会公开管理员身份信息。"
         )
 
     if compact in ("help", "/help", "帮助", "/帮助") or _contains_any(
@@ -214,9 +251,9 @@ def get_local_public_reply(text: str) -> str | None:
         ("有哪些命令", "有哪些指令", "命令", "指令", "使用方法", "怎么用这个bot"),
     ):
         return (
-            "常用命令有：/register 提交注册申请，/help 查看帮助，/subscribe 管理订阅，/list 查看作业，"
-            "/add 添加作业，/done 标记完成，/remind 设置提醒，/today 查看今日课程，"
-            "/briefing 查看早报。审批通过后也支持直接用自然语言操作。"
+            "常用命令有：/register 提交注册申请，/help 查看帮助，/agenda 看事项总览，"
+            "/subscribe 管理订阅，/list 查看作业，/add 添加作业，/remind 设置提醒，"
+            "/today 查看今日课程，/briefing 查看早报。审批通过后也支持直接用自然语言操作。"
         )
 
     if _contains_any(
@@ -241,8 +278,23 @@ def get_local_public_reply(text: str) -> str | None:
         ),
     ):
         return (
-            "作业相关命令有 /list、/add、/done、/delete、/stats、/rules。"
-            "管理员添加的是公共作业，普通用户添加的是私人作业。"
+            "作业型事项相关命令有 /list、/add、/done、/delete、/stats、/rules。"
+            "如果想看统一总览，可以用 /agenda。管理员添加的是公共作业，普通用户添加的是私人作业。"
+        )
+
+    if _contains_any(
+        compact,
+        (
+            "待办",
+            "事项总览",
+            "最近有什么事",
+            "看一下事项",
+            "查看待办",
+            "agenda",
+        ),
+    ):
+        return (
+            "审批通过后可以用 /agenda 查看统一事项总览，里面会汇总今日课程、待完成作业和待发送提醒。"
         )
 
     if _contains_any(
@@ -257,6 +309,7 @@ def get_local_public_reply(text: str) -> str | None:
     ):
         return (
             "提醒相关命令有 /remind、/reminders、/cancel。"
+            "如果想把课程、作业和提醒放到一个总览里看，可以用 /agenda。"
             "审批通过后也可以直接用自然语言说“明天下午 3 点提醒我开会”。"
         )
 
@@ -273,7 +326,7 @@ def get_local_public_reply(text: str) -> str | None:
     ):
         return (
             "课程相关命令有 /today、/courses、/briefing、/notify、/addcourse、/delcourse。"
-            "/notify 可以开关上课提醒。自定义课程名当前全局唯一。"
+            "/notify 可以开关上课提醒。公共课程名全局唯一；私人课程名仅对自己唯一。"
         )
 
     if _contains_any(
@@ -287,7 +340,7 @@ def get_local_public_reply(text: str) -> str | None:
         ),
     ):
         return (
-            "审批通过后，你可以直接用自然语言添加或删除自己的作业、设置提醒、查看作业和课程。"
+            "审批通过后，你可以直接用自然语言查看事项总览、添加或删除自己的作业型事项、设置提醒、查看作业和课程。"
             "未审批用户也可以先询问公开功能和使用方式。"
         )
 
@@ -296,8 +349,8 @@ def get_local_public_reply(text: str) -> str | None:
         ("课程重名", "同名课程", "为什么不能添加同名课程", "课程名重复"),
     ):
         return (
-            "自定义课程名当前按全局唯一处理，不能与现有公共或私人课程重名。"
-            "这是一条当前实现限制。"
+            "公共课程名必须全局唯一；私人课程名只需要对自己唯一，"
+            "可以与其他用户重名，但不能与公共课程重名。"
         )
 
     if _contains_any(

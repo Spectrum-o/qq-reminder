@@ -21,6 +21,8 @@ class Course:
     teacher: str
     time_slots: str
     location: str
+    visibility: str = "public"
+    owner_id: str = ""
 
 
 def parse_courses() -> list[Course]:
@@ -162,16 +164,29 @@ def add_custom_course(
     teacher: str = "",
     location: str = "",
 ) -> dict | None:
-    """Add a custom course. Returns None if a course with the same name already exists."""
-    # Check duplicates in course.txt
+    """Add a custom course.
+
+    Public course names remain globally unique.
+    Private course names must only be unique for the same owner, but still cannot
+    collide with any public course.
+    """
     for c in parse_courses():
         if c.name == name:
             return None
-    # Check duplicates in custom_courses.json
+
     courses = load_custom_courses()
     for c in courses:
-        if c["name"] == name:
+        if c["name"] != name:
+            continue
+        existing_visibility = c.get("visibility", "public")
+        existing_owner_id = c.get("owner_id", "")
+        if visibility == "public":
             return None
+        if existing_visibility == "public":
+            return None
+        if existing_owner_id == owner_id:
+            return None
+
     entry = {
         "id": _next_custom_id(courses),
         "name": name,
@@ -186,23 +201,39 @@ def add_custom_course(
     return entry
 
 
-def delete_custom_course(name: str, user_id: str, is_admin: bool) -> bool:
+def delete_custom_course(name: str, user_id: str, is_admin: bool) -> dict | None:
     courses = load_custom_courses()
     remaining = []
-    found = False
+    deleted: dict | None = None
     for c in courses:
         if c["name"] == name:
             # Admin can delete any public course; user can delete own private course
             if is_admin and c["visibility"] == "public":
-                found = True
+                deleted = c
                 continue
             if c["owner_id"] == user_id and c["visibility"] == "private":
-                found = True
+                deleted = c
                 continue
         remaining.append(c)
-    if found:
+    if deleted is not None:
         save_custom_courses(remaining)
-    return found
+    return deleted
+
+
+def delete_private_custom_courses_by_owner(owner_id: str) -> list[dict]:
+    courses = load_custom_courses()
+    deleted = [
+        c for c in courses
+        if c.get("visibility") == "private" and c.get("owner_id") == owner_id
+    ]
+    if not deleted:
+        return []
+    remaining = [
+        c for c in courses
+        if not (c.get("visibility") == "private" and c.get("owner_id") == owner_id)
+    ]
+    save_custom_courses(remaining)
+    return deleted
 
 
 def get_all_courses(
@@ -230,6 +261,8 @@ def get_all_courses(
             teacher=c.get("teacher", ""),
             time_slots=c.get("time_slots", "未安排"),
             location=c.get("location", "") or "未安排",
+            visibility=c.get("visibility", "public"),
+            owner_id=c.get("owner_id", ""),
         ))
 
     return courses

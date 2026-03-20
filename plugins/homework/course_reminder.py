@@ -122,6 +122,8 @@ def _get_today_courses(
                         "location": location,
                         "time": start_time,
                         "period": first_period,
+                        "visibility": getattr(course, "visibility", "public"),
+                        "owner_id": getattr(course, "owner_id", ""),
                     })
     result.sort(key=lambda x: x["time"])
     return result
@@ -194,7 +196,11 @@ async def generate_course_reminders_for_date(target_date: date | None = None):
             f"  教师: {c['teacher']}{location_info}"
         )
 
-        recipients = notify_subs.get(c["name"], [])
+        if c.get("visibility") == "private":
+            owner_id = c.get("owner_id", "")
+            recipients = [owner_id] if owner_id in notify_subs.get(c["name"], []) else []
+        else:
+            recipients = notify_subs.get(c["name"], [])
 
         for user_id in recipients:
             # Collect for morning summary

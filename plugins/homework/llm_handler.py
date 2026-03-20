@@ -18,12 +18,14 @@ from .config import (
     LLM_USER_RATE_LIMIT_MAX_REQUESTS,
     LLM_USER_RATE_LIMIT_WINDOW_SECONDS,
 )
+from .agenda_service import build_agenda_message
 from .course_service import format_today_schedule_for_user
-from .assignment_service import list_pending_message
 from .public_info import (
     get_local_public_reply,
     get_preapproval_local_reply,
     get_sensitive_query_reply,
+    is_all_user_list_query,
+    is_pending_user_list_query,
 )
 from .user_service import ROLE_ADMIN, ROLE_ROOT, ROLE_USER, get_user_role
 from . import llm_service
@@ -138,13 +140,16 @@ async def handle_llm_fallback(bot: Bot, event: PrivateMessageEvent):
     if not text:
         return
 
-    sensitive_reply = get_sensitive_query_reply(text)
-    if sensitive_reply:
-        await llm_fallback.finish(sensitive_reply)
-
     user_id = str(event.user_id)
     role = await get_user_role(user_id)
     is_approved_user = role in (ROLE_ROOT, ROLE_ADMIN, ROLE_USER)
+
+    sensitive_reply = get_sensitive_query_reply(text)
+    if sensitive_reply and not (
+        ((role == ROLE_ROOT or role == ROLE_ADMIN) and is_pending_user_list_query(text))
+        or (role == ROLE_ROOT and is_all_user_list_query(text))
+    ):
+        await llm_fallback.finish(sensitive_reply)
 
     if not is_approved_user:
         public_reply = get_local_public_reply(text)
@@ -176,11 +181,11 @@ async def handle_llm_fallback(bot: Bot, event: PrivateMessageEvent):
         logger.warning("LLM user rate limit hit for user %s", user_id)
         await llm_fallback.finish(deny_message)
 
-    assignments_text = await list_pending_message(user_id)
+    agenda_text = await build_agenda_message(user_id)
     schedule_text = await format_today_schedule_for_user(user_id)
 
     reply = await llm_service.chat(
-        text, assignments_text, schedule_text, user_id=user_id, role=role
+        text, agenda_text, schedule_text, user_id=user_id, role=role
     )
     if reply:
         await llm_fallback.finish(reply)

@@ -95,11 +95,12 @@ async def sync_homework_reminders_for_user(user_id: str) -> None:
     subscriptions = set(await get_subscriptions(user_id))
     rows = await list_undone_assignments(user_id)
     for row in rows:
-        if row["course"] in subscriptions:
-            reminders = _build_homework_reminders(
-                row["id"], row["course"], row["description"], row["deadline"], user_id
-            )
-            await sync_reminders("homework", str(row["id"]), reminders, user_id)
+        if row.get("visibility") != "private" and row["course"] not in subscriptions:
+            continue
+        reminders = _build_homework_reminders(
+            row["id"], row["course"], row["description"], row["deadline"], user_id
+        )
+        await sync_reminders("homework", str(row["id"]), reminders, user_id)
 
 
 async def apply_assignment_sync_outcome(outcome: SyncOutcome) -> None:

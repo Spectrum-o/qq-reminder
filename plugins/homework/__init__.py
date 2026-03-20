@@ -14,8 +14,8 @@ from . import daily_briefing  # noqa: F401
 from . import llm_handler  # noqa: F401
 
 __plugin_meta__ = PluginMetadata(
-    name="作业 & 课程提醒",
-    description="课程作业截止日期提醒 + 上课提醒",
+    name="事项提醒",
+    description="课程、作业与个人事项提醒",
     usage="/help 查看所有命令",
 )
 
