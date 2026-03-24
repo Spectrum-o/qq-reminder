@@ -22,11 +22,13 @@ from .assignment_service import (
 )
 from .config import LLM_API_BASE, LLM_API_KEY, LLM_MODEL
 from .course_parser import add_custom_course, delete_custom_course, is_valid_time_slots
-from .course_service import format_today_schedule_for_user
+from .course_service import format_course_catalog, format_today_schedule_for_user
 from .database import (
     add_reminder,
     delete_assignments_by_course,
     delete_course_reminders_for_user_course_keys,
+    delete_homework_reminders_for_user_course_keys,
+    delete_homework_reminders_for_user_courses,
     delete_reminder,
     delete_reminders_by_course,
     delete_subscriptions_by_course,
@@ -45,10 +47,14 @@ from .user_service import (
     approve_user as approve_pending_user,
     get_user_subscription_selector_map,
     get_user_subscriptions,
+    get_user_subscription_names,
+    get_visible_course_selectors,
     list_all_users as list_all_user_rows,
     list_pending_users as list_pending_user_rows,
     resolve_visible_course,
+    subscribe_all_courses,
     subscribe_courses,
+    unsubscribe_courses,
 )
 
 # ── Shared async client (bypass system proxy) ────
@@ -172,6 +178,22 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "list_courses",
+            "description": "查看当前用户可见的课程目录。用户问有哪些课、课程列表时调用。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_my_courses",
+            "description": "查看当前用户已订阅的课程。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "add_custom_reminder",
             "description": "设置一个自定义提醒（不限于作业，如取快递、开会等）。当用户说提醒我、别忘了时调用。",
             "parameters": {
@@ -209,14 +231,18 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "cancel_reminder",
-            "description": "取消一条自定义提醒。",
+            "name": "cancel_reminders",
+            "description": "取消一条或多条自定义提醒。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "reminder_id": {"type": "integer", "description": "提醒编号"},
+                    "reminder_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "提醒编号数组，按用户提及顺序填写",
+                    },
                 },
-                "required": ["reminder_id"],
+                "required": ["reminder_ids"],
             },
         },
     },
@@ -245,6 +271,56 @@ TOOLS = [
                     },
                 },
                 "required": ["value"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "subscribe_courses",
+            "description": (
+                "订阅一门或多门现有课程。"
+                "参数必须使用精确课程 selector，如 大学英语#sd101。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "course_selectors": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "要订阅的精确课程 selector 数组，按用户提及顺序填写",
+                    },
+                },
+                "required": ["course_selectors"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "subscribe_all_courses",
+            "description": "订阅当前所有可见课程。用户说订阅全部课程、全选课程时调用。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "unsubscribe_courses",
+            "description": (
+                "退订一门或多门已订阅课程。"
+                "参数必须使用精确课程 selector，如 大学英语#sd101。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "course_selectors": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "要退订的精确课程 selector 数组，按用户提及顺序填写",
+                    },
+                },
+                "required": ["course_selectors"],
             },
         },
     },
@@ -356,28 +432,45 @@ ACTION: {"action": "<动作名>", "args": {<参数>}}
 4. list_assignments - 查看作业列表
    args: {}
 
-5. today_schedule - 查看今日课程
+5. list_courses - 查看可见课程目录
    args: {}
 
-6. list_reminders - 查看待发送提醒
+6. list_my_courses - 查看已订阅课程
    args: {}
 
-7. get_briefing_settings - 查看每日早报状态和时间
+7. today_schedule - 查看今日课程
    args: {}
 
-8. set_briefing_time - 设置每日早报时间或开关
+8. list_reminders - 查看待发送提醒
+   args: {}
+
+9. get_briefing_settings - 查看每日早报状态和时间
+   args: {}
+
+10. set_briefing_time - 设置每日早报时间或开关
    args: {"value": "7:30 / 08:00 / 7点半 / on / off"}
 
-9. cancel_reminder - 取消提醒
-   args: {"reminder_id": 编号}
+11. cancel_reminders - 取消一条或多条提醒
+   args: {"reminder_ids": [编号1, 编号2]}
 
-10. add_assignment - 添加作业（管理员=公共, 普通用户=私人）
+12. add_assignment - 添加作业（管理员=公共, 普通用户=私人）
    args: {"course": "课程名", "deadline": "YYYY-MM-DD HH:MM", "description": "描述"}
 
-11. delete_assignments - 删除一条或多条作业（管理员删公共, 用户删自己的私人）
+13. delete_assignments - 删除一条或多条作业（管理员删公共, 用户删自己的私人）
    args: {"assignment_ids": [编号1, 编号2]}
 
-12. add_course - 添加课程（管理员添加公共课程，普通用户添加私人课程）
+14. subscribe_courses - 订阅一门或多门现有课程
+    args: {"course_selectors": ["大学英语#sd101", "高等数学"]}
+    必须使用精确课程 selector；同名公共课不能省略 #课程编号
+
+15. subscribe_all_courses - 订阅全部可见课程
+    args: {}
+
+16. unsubscribe_courses - 退订一门或多门已订阅课程
+    args: {"course_selectors": ["大学英语#sd101", "高等数学"]}
+    必须使用精确课程 selector；同名公共课不能省略 #课程编号
+
+17. add_course - 添加课程（管理员添加公共课程，普通用户添加私人课程）
    args: {"name": "课程名", "time_slots": "时间，必须是标准格式: X-Y周 星期Z A-B"}
    时间格式说明:
    - X-Y周 = 上课的周数范围，如 1-18周、1-16周
@@ -386,20 +479,20 @@ ACTION: {"action": "<动作名>", "args": {<参数>}}
    - 多个时间段用分号分隔: "1-18周 星期一 3-4; 1-18周 星期三 5-6"
    用户可能用各种自然语言描述，你必须转换为标准格式
 
-13. delete_course - 删除课程
+18. delete_course - 删除课程
     args: {"name": "课程名"}
 
-14. toggle_course_notify - 开启/关闭某课程的上课提醒（早上7:30+课前提醒）
+19. toggle_course_notify - 开启/关闭某课程的上课提醒（早上7:30+课前提醒）
     args: {"name": "课程名"}
     同名公共课请优先使用精确课程名，如 大学英语#sd101
 
-15. list_pending_users - 查看待审核用户（仅管理员和 root）
+20. list_pending_users - 查看待审核用户（仅管理员和 root）
     args: {}
 
-16. list_all_users - 查看所有用户及其角色（仅 root）
+21. list_all_users - 查看所有用户及其角色（仅 root）
     args: {}
 
-17. approve_user - 审批待审核用户
+22. approve_user - 审批待审核用户
     args: {"qq_id": "QQ号", "role": "user 或 admin，默认 user"}
     权限说明:
     - admin 只能审批为 user
@@ -418,6 +511,14 @@ ACTION: {"action": "add_custom_reminder", "args": {"title": "拿快递", "remind
 回复:
 ACTION: {"action": "list_assignments", "args": {}}
 
+用户: 这学期有哪些课
+回复:
+ACTION: {"action": "list_courses", "args": {}}
+
+用户: 我订了哪些课
+回复:
+ACTION: {"action": "list_my_courses", "args": {}}
+
 用户: 计算理论4月17日23:59前交纸质作 1.4a
 回复: 好的，我帮你记下这条作业。
 ACTION: {"action": "add_assignment", "args": {"course": "计算理论", "deadline": "2026-04-17 23:59", "description": "纸质作 1.4a"}}
@@ -429,6 +530,22 @@ ACTION: {"action": "complete_assignments", "args": {"assignment_ids": [3, 4]}}
 用户: 删除作业 3 4 2
 回复: 好的，我帮你一起删除。
 ACTION: {"action": "delete_assignments", "args": {"assignment_ids": [3, 4, 2]}}
+
+用户: 取消提醒 3 和 5
+回复: 好的，我帮你一起取消。
+ACTION: {"action": "cancel_reminders", "args": {"reminder_ids": [3, 5]}}
+
+用户: 帮我订阅大学英语#sd101和高等数学
+回复: 好的，我帮你订上。
+ACTION: {"action": "subscribe_courses", "args": {"course_selectors": ["大学英语#sd101", "高等数学"]}}
+
+用户: 把我能看的课程都订阅上
+回复: 好的，我帮你全部订阅。
+ACTION: {"action": "subscribe_all_courses", "args": {}}
+
+用户: 退订大学英语#sd101
+回复: 好的，我帮你退订。
+ACTION: {"action": "unsubscribe_courses", "args": {"course_selectors": ["大学英语#sd101"]}}
 
 用户: 我的早报几点发
 回复:
@@ -479,6 +596,8 @@ ACTION: {"action": "approve_user", "args": {"qq_id": "123456789", "role": "user"
 重要: args 里的参数名必须严格使用上面列出的名称（如 title、remind_at、time_slots），不要用其他名称。
 重要: complete_assignments.assignment_ids 和 delete_assignments.assignment_ids 必须使用用户当前 /list 里看到的作业编号。
 重要: 涉及多个作业编号时，必须使用数组一次性表达，不要只挑一个编号执行。
+重要: cancel_reminders.reminder_ids 必须使用用户当前提醒列表里看到的提醒编号；涉及多个提醒时必须使用数组。
+重要: subscribe_courses.course_selectors 和 unsubscribe_courses.course_selectors 必须使用精确课程 selector；同名公共课必须保留 #课程编号。
 重要: add_assignment 只用于新增作业；如果用户是在问是否支持、怎么用，或是在修改已有作业，不要输出 ACTION。
 重要: 如果新增作业缺课程、截止时间、作业内容中的任一项，先追问，不要输出带空字符串的 ACTION。
 重要: add_assignment.deadline 和 add_custom_reminder.remind_at 必须是 YYYY-MM-DD HH:MM。
@@ -614,6 +733,128 @@ def _parse_assignment_ids_arg(
     return assignment_ids, None
 
 
+def _parse_positive_int_array_arg(
+    args: dict,
+    *,
+    array_key: str,
+    single_key: str,
+    label: str,
+) -> tuple[list[int] | None, str | None]:
+    raw_values = args.get(array_key)
+    if raw_values is None and single_key in args:
+        raw_values = [args[single_key]]
+    if not isinstance(raw_values, list) or not raw_values:
+        return None, f"请提供至少一个{label}编号"
+
+    values: list[int] = []
+    seen: set[int] = set()
+    for raw_value in raw_values:
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError):
+            return None, f"{label}编号格式错误，请使用整数数组"
+        if value <= 0:
+            return None, f"{label}编号必须是正整数"
+        if value in seen:
+            continue
+        seen.add(value)
+        values.append(value)
+
+    if not values:
+        return None, f"请提供至少一个{label}编号"
+    return values, None
+
+
+def _parse_course_selectors_arg(args: dict) -> tuple[list[str] | None, str | None]:
+    raw_values = args.get("course_selectors")
+    if raw_values is None and "course_selector" in args:
+        raw_values = [args["course_selector"]]
+    if raw_values is None and "name" in args:
+        raw_values = [args["name"]]
+    if not isinstance(raw_values, list) or not raw_values:
+        return None, "请提供至少一门课程"
+
+    selectors: list[str] = []
+    seen: set[str] = set()
+    for raw_value in raw_values:
+        selector = str(raw_value).strip()
+        if not selector:
+            return None, "课程名不能为空"
+        if selector in seen:
+            continue
+        seen.add(selector)
+        selectors.append(selector)
+
+    if not selectors:
+        return None, "请提供至少一门课程"
+    return selectors, None
+
+
+async def _format_my_courses(user_id: str) -> str:
+    subscriptions = await get_user_subscriptions(user_id)
+    if not subscriptions:
+        return "你还没有订阅任何课程\n使用 /subscribe <课程名> 订阅"
+    lines = ["我的订阅课程:"]
+    for selector in sorted(subscriptions):
+        lines.append(f"  {selector}")
+    return "\n".join(lines)
+
+
+async def _validate_pending_reminder_ids(
+    user_id: str, reminder_ids: list[int]
+) -> str | None:
+    rows = await list_pending_custom_reminders(user_id)
+    available_ids = {int(row["id"]) for row in rows}
+    for reminder_id in reminder_ids:
+        if reminder_id not in available_ids:
+            return f"未找到编号 #{reminder_id} 的待发送提醒"
+    return None
+
+
+async def _validate_visible_course_selectors(selectors: list[str], user_id: str) -> str | None:
+    visible_selectors = set(get_visible_course_selectors(user_id))
+    invalid = [selector for selector in selectors if selector not in visible_selectors]
+    if invalid:
+        return f"未找到课程: {'、'.join(invalid)}"
+    return None
+
+
+async def _validate_subscribed_course_selectors(
+    selectors: list[str], user_id: str
+) -> str | None:
+    subscribed_selectors = set(await get_user_subscriptions(user_id))
+    invalid = [selector for selector in selectors if selector not in subscribed_selectors]
+    if invalid:
+        return f"你未订阅课程: {'、'.join(invalid)}"
+    return None
+
+
+async def _cleanup_unsubscribed_course_side_effects(
+    user_id: str, removed: list[str]
+) -> None:
+    if not removed:
+        return
+
+    cleanup_keys = [
+        course.course_key
+        for selector in removed
+        if (course := resolve_visible_course(user_id, selector)) is not None
+    ]
+    remaining_names = set(await get_user_subscription_names(user_id))
+    cleanup_names = sorted(
+        {
+            course.name
+            for selector in removed
+            if (course := resolve_visible_course(user_id, selector)) is not None
+            and course.name not in remaining_names
+        }
+    )
+    await delete_homework_reminders_for_user_course_keys(user_id, cleanup_keys)
+    await delete_homework_reminders_for_user_courses(user_id, cleanup_names)
+    await delete_course_reminders_for_user_course_keys(user_id, cleanup_keys)
+    await _refresh_today_course_reminders()
+
+
 def _parse_llm_datetime(raw: str, field_label: str, example: str) -> tuple[str | None, str | None]:
     value = str(raw).strip()
     if not value:
@@ -681,6 +922,11 @@ def _build_system_prompt(context: str, use_json_fallback: bool, role: str | None
         "如果你无法把时间唯一换算成标准时间，就先追问，不要输出模糊时间。\n"
         "涉及作业完成或删除时，优先使用批量动作 complete_assignments / delete_assignments；"
         "即使只有 1 个编号，也要用 assignment_ids 数组表达。\n"
+        "涉及提醒取消时，优先使用批量动作 cancel_reminders；"
+        "即使只有 1 个编号，也要用 reminder_ids 数组表达。\n"
+        "涉及课程订阅或退订时，优先使用 list_courses / list_my_courses 查看上下文，"
+        "再使用 subscribe_courses / unsubscribe_courses / subscribe_all_courses；"
+        "course_selectors 必须使用精确课程 selector，同名公共课必须保留 #课程编号。\n"
         "涉及每日早报时间或开关时，不要当成普通提醒，优先使用 get_briefing_settings 或 set_briefing_time；"
         "如果用户只说想修改早报但没给目标时间，可以先追问具体时间。\n"
         "涉及课程操作时，优先使用当前上下文里的精确课程名；"
@@ -724,10 +970,13 @@ def _build_public_system_prompt(public_context: str) -> str:
 def _build_context(
     agenda_text: str,
     schedule_text: str,
+    course_catalog_text: str,
     public_context: str,
     subscription_text: str,
 ) -> str:
     parts = [f"公开功能说明:\n{public_context}"]
+    if course_catalog_text:
+        parts.append(f"当前可见课程目录:\n{course_catalog_text}")
     if subscription_text:
         parts.append(f"当前已订阅课程:\n{subscription_text}")
     if agenda_text:
@@ -809,9 +1058,11 @@ async def chat(
         return ""
 
     subscription_text = await _build_subscription_context(user_id) if user_id else ""
+    course_catalog_text = format_course_catalog(user_id) if user_id else ""
     context = _build_context(
         agenda_text,
         schedule_text,
+        course_catalog_text,
         PUBLIC_BOT_GUIDE,
         subscription_text,
     )
@@ -940,6 +1191,12 @@ async def _execute_tool(name: str, args: dict, user_id: str, role: str | None) -
         if name == "list_assignments":
             return await list_pending_message(user_id)
 
+        if name == "list_courses":
+            return format_course_catalog(user_id)
+
+        if name == "list_my_courses":
+            return await _format_my_courses(user_id)
+
         if name == "get_briefing_settings":
             settings = await get_briefing_settings(user_id)
             if settings is None:
@@ -1017,10 +1274,64 @@ async def _execute_tool(name: str, args: dict, user_id: str, role: str | None) -
                     lines.append(f"  #{r['id']}  {r['remind_at']}  {r['title']}")
             return "\n".join(lines)
 
-        if name == "cancel_reminder":
-            rid = int(args["reminder_id"])
-            ok = await delete_reminder(rid, user_id)
-            return f"提醒 #{rid} 已取消" if ok else f"未找到编号 #{rid} 的待发送提醒"
+        if name in {"cancel_reminders", "cancel_reminder"}:
+            reminder_ids, error = _parse_positive_int_array_arg(
+                args,
+                array_key="reminder_ids",
+                single_key="reminder_id",
+                label="提醒",
+            )
+            if error:
+                return error
+            assert reminder_ids is not None
+            validation_error = await _validate_pending_reminder_ids(user_id, reminder_ids)
+            if validation_error:
+                return f"{validation_error}，未执行取消"
+
+            for reminder_id in reminder_ids:
+                ok = await delete_reminder(reminder_id, user_id)
+                if not ok:
+                    return f"提醒 #{reminder_id} 取消失败，已中止"
+
+            shown_ids = "、".join(f"#{reminder_id}" for reminder_id in reminder_ids)
+            return f"已取消提醒 {shown_ids}"
+
+        if name == "subscribe_courses":
+            course_selectors, error = _parse_course_selectors_arg(args)
+            if error:
+                return error
+            assert course_selectors is not None
+            validation_error = await _validate_visible_course_selectors(course_selectors, user_id)
+            if validation_error:
+                return validation_error
+            added = await subscribe_courses(user_id, course_selectors)
+            await sync_homework_reminders_for_user(user_id)
+            await _refresh_today_course_reminders()
+            if not added:
+                return "这些课程已全部订阅"
+            return f"已订阅: {', '.join(added)}"
+
+        if name == "subscribe_all_courses":
+            added = await subscribe_all_courses(user_id)
+            await sync_homework_reminders_for_user(user_id)
+            await _refresh_today_course_reminders()
+            return f"已订阅全部课程 ({len(added)} 门新订阅)"
+
+        if name == "unsubscribe_courses":
+            course_selectors, error = _parse_course_selectors_arg(args)
+            if error:
+                return error
+            assert course_selectors is not None
+            validation_error = await _validate_subscribed_course_selectors(
+                course_selectors, user_id
+            )
+            if validation_error:
+                return validation_error
+            removed = await unsubscribe_courses(user_id, course_selectors)
+            if not removed:
+                return "未找到匹配的订阅"
+            await _cleanup_unsubscribed_course_side_effects(user_id, removed)
+            return f"已退订: {', '.join(removed)}"
 
         if name == "add_course":
             course_name = args.get("name", "")

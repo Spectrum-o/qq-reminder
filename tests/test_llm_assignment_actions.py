@@ -228,9 +228,59 @@ class TestLlmAssignmentActions:
 
         assert result == "已设置提醒: 开会 (2026-03-25 15:00)"
 
+    async def test_cancel_reminders_is_atomic(self, env_with_users):
+        await _execute_tool(
+            "add_custom_reminder",
+            {"title": "开会", "remind_at": "2026-03-25 15:00"},
+            "user1",
+            "user",
+        )
+        await _execute_tool(
+            "add_custom_reminder",
+            {"title": "拿快递", "remind_at": "2026-03-25 16:00"},
+            "user1",
+            "user",
+        )
+
+        result = await _execute_tool(
+            "cancel_reminders",
+            {"reminder_ids": [3, 1]},
+            "user1",
+            "user",
+        )
+
+        assert result == "未找到编号 #3 的待发送提醒，未执行取消"
+        rows = await list_pending_custom_reminders("user1")
+        assert [row["title"] for row in rows] == ["提醒: 开会", "提醒: 拿快递"]
+
+    async def test_cancel_reminders_cancels_all_requested_ids(self, env_with_users):
+        await _execute_tool(
+            "add_custom_reminder",
+            {"title": "开会", "remind_at": "2026-03-25 15:00"},
+            "user1",
+            "user",
+        )
+        await _execute_tool(
+            "add_custom_reminder",
+            {"title": "拿快递", "remind_at": "2026-03-25 16:00"},
+            "user1",
+            "user",
+        )
+
+        result = await _execute_tool(
+            "cancel_reminders",
+            {"reminder_ids": [2, 1]},
+            "user1",
+            "user",
+        )
+
+        assert result == "已取消提醒 #2、#1"
+        assert await list_pending_custom_reminders("user1") == []
+
     def test_llm_prompt_requires_standard_datetime_for_actions(self):
         prompt = _build_system_prompt("上下文", use_json_fallback=True, role="user")
 
         assert "必须使用 YYYY-MM-DD HH:MM 绝对时间格式" in prompt
         assert "不要把 明天、这周四之前、下周一上午" in prompt
         assert "complete_assignments / delete_assignments" in prompt
+        assert "cancel_reminders" in prompt
