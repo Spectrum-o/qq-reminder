@@ -44,6 +44,40 @@ _BRIEFING_FOLLOWUP_TTL_SECONDS = 300
 _BRIEFING_TIME_CANDIDATE_RE = re.compile(
     r"(\d{1,2}\s*[:：]\s*\d{1,2}|\d{1,2}\s*(?:点|时)(?:半|\d{1,2}分?)?)"
 )
+_ASSIGNMENT_TIME_HINT_RE = re.compile(
+    r"(今天|明天|后天|大后天|本周[一二三四五六日天]|这周[一二三四五六日天]"
+    r"|下周[一二三四五六日天]|周[一二三四五六日天]"
+    r"|\d{1,2}\s*[月/\.]\s*\d{1,2}"
+    r"|\d{4}\s*-\s*\d{1,2}\s*-\s*\d{1,2}"
+    r"|\d{1,2}\s*[:：]\s*\d{1,2}"
+    r"|截止|之前|ddl|deadline|上午|中午|下午|晚上|今晚)"
+)
+_ASSIGNMENT_CAPABILITY_TOKENS = (
+    "我可以",
+    "可不可以",
+    "能不能",
+    "能否",
+    "怎么",
+    "如何",
+    "支持",
+    "行不行",
+    "可以吗",
+)
+_ASSIGNMENT_ADD_TOKENS = ("添加", "加", "记", "记录", "录入", "创建")
+_ASSIGNMENT_UPDATE_TOKENS = (
+    "修改",
+    "改成",
+    "改到",
+    "改下",
+    "改一下",
+    "调整",
+    "更新",
+    "延期",
+    "延后",
+    "推迟",
+    "提前",
+    "变更",
+)
 
 
 @dataclass(frozen=True)
@@ -209,6 +243,44 @@ def _is_briefing_update_intent(text: str) -> bool:
     )
 
 
+def _is_assignment_capability_query(text: str) -> bool:
+    normalized = text.strip()
+    if "作业" not in normalized:
+        return False
+    if not any(token in normalized for token in _ASSIGNMENT_ADD_TOKENS):
+        return False
+    if not any(token in normalized for token in _ASSIGNMENT_CAPABILITY_TOKENS):
+        return False
+    return _ASSIGNMENT_TIME_HINT_RE.search(normalized) is None
+
+
+def _is_assignment_update_intent(text: str) -> bool:
+    normalized = text.strip()
+    if not any(token in normalized for token in ("作业", "截止", "ddl", "deadline")):
+        return False
+    return any(token in normalized for token in _ASSIGNMENT_UPDATE_TOKENS)
+
+
+async def _try_handle_local_assignment_message(text: str) -> str | None:
+    normalized = text.strip()
+    if not normalized:
+        return None
+
+    if _is_assignment_capability_query(normalized):
+        return (
+            "可以。直接发“课程名 + 截止时间 + 作业内容”就行，"
+            "比如“计算理论这周四之前交纸质作 1.4a”。"
+        )
+
+    if _is_assignment_update_intent(normalized):
+        return (
+            "我现在还不会直接修改已有作业，避免误加成一条新作业。"
+            "先 /list 看编号，删掉原作业后再把新的截止时间和内容发给我。"
+        )
+
+    return None
+
+
 async def _try_handle_local_briefing_message(
     text: str,
     user_id: str,
@@ -287,6 +359,10 @@ async def handle_llm_fallback(bot: Bot, event: PrivateMessageEvent):
     local_briefing_reply = await _try_handle_local_briefing_message(text, user_id, role)
     if local_briefing_reply:
         await llm_fallback.finish(local_briefing_reply)
+
+    local_assignment_reply = await _try_handle_local_assignment_message(text)
+    if local_assignment_reply:
+        await llm_fallback.finish(local_assignment_reply)
 
     allowed, deny_message = _allow_llm_request(user_id, _USER_POLICY)
     if not allowed:
