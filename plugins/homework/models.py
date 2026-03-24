@@ -454,7 +454,7 @@ class RecurringAssignmentRule:
             return "按生成窗口"
         if self.release_after_class == "last":
             return "本周期最后一节课后"
-        return f"本周期第{self.release_after_class}节匹配课程后"
+        return f"本周期第{self.release_after_class}次匹配课程后"
 
     def _first_due_date_on_or_after(self, target: date) -> date | None:
         if self.end_date and target > self.end_date:
