@@ -12,10 +12,10 @@ from openai import AsyncOpenAI
 from .agenda_service import build_agenda_message
 from .assignment_service import (
     add_manual_assignment,
-    complete_assignment,
+    complete_assignment_by_display_id,
+    get_assignment_display_id_for_user,
     list_pending_message,
-    remove_assignment,
-    remove_assignment_checked,
+    remove_assignment_checked_by_display_id,
     sync_homework_reminders_for_user,
 )
 from .config import LLM_API_BASE, LLM_API_KEY, LLM_MODEL
@@ -117,7 +117,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "assignment_id": {"type": "integer", "description": "作业编号"},
+                    "assignment_id": {"type": "integer", "description": "用户当前 /list 里看到的作业编号"},
                 },
                 "required": ["assignment_id"],
             },
@@ -131,7 +131,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "assignment_id": {"type": "integer", "description": "作业编号"},
+                    "assignment_id": {"type": "integer", "description": "用户当前 /list 里看到的作业编号"},
                 },
                 "required": ["assignment_id"],
             },
@@ -453,6 +453,7 @@ ACTION: {"action": "approve_user", "args": {"qq_id": "123456789", "role": "user"
 回复: 我现在还不能直接修改已有作业，你先 /list 看编号，删除旧作业后再把新的截止时间和内容发给我。
 
 重要: args 里的参数名必须严格使用上面列出的名称（如 title、remind_at、time_slots），不要用其他名称。
+重要: complete_assignment.assignment_id 和 delete_assignment.assignment_id 必须使用用户当前 /list 里看到的作业编号。
 重要: add_assignment 只用于新增作业；如果用户是在问是否支持、怎么用，或是在修改已有作业，不要输出 ACTION。
 重要: 如果新增作业缺课程、截止时间、作业内容中的任一项，先追问，不要输出带空字符串的 ACTION。
 重要: add_assignment.deadline 和 add_custom_reminder.remind_at 必须是 YYYY-MM-DD HH:MM。
@@ -754,20 +755,24 @@ async def _execute_tool(name: str, args: dict, user_id: str, role: str | None) -
                 visibility=visibility, owner_id=user_id,
                 course_key=course.course_key,
             )
+            display_id = await get_assignment_display_id_for_user(user_id, aid)
             label = "公共" if visibility == "public" else "私人"
+            shown_id = display_id if display_id is not None else aid
             return (
-                f"已添加{label}作业 #{aid}: [{course_name}] {description}\n"
+                f"已添加{label}作业 #{shown_id}: [{course_name}] {description}\n"
                 f"截止: {deadline_iso}"
             )
 
         if name == "complete_assignment":
             aid = int(args["assignment_id"])
-            ok = await complete_assignment(user_id, aid)
+            ok = await complete_assignment_by_display_id(user_id, aid)
             return f"作业 #{aid} 已完成!" if ok else f"未找到编号 #{aid} 的待完成作业"
 
         if name == "delete_assignment":
             aid = int(args["assignment_id"])
-            error = await remove_assignment_checked(aid, user_id, _is_admin_or_above(role))
+            error = await remove_assignment_checked_by_display_id(
+                aid, user_id, _is_admin_or_above(role)
+            )
             return error if error else f"作业 #{aid} 已删除"
 
         if name == "list_agenda":

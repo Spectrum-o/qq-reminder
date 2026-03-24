@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from .assignment_service import list_pending_rows_with_display_ids
 from .course_parser import build_course_key_selector_map, get_all_courses
 from .course_reminder import get_today_schedule_for_user
-from .database import list_pending, list_pending_custom_reminders
+from .database import list_pending_custom_reminders
 from .models import STORED_DATETIME_FORMAT
 
 
@@ -44,7 +45,7 @@ async def build_agenda_message(user_id: str) -> str:
 
     entries: list[tuple[datetime, str]] = []
 
-    for row in await list_pending(user_id):
+    for row in await list_pending_rows_with_display_ids(user_id):
         try:
             deadline_dt = datetime.strptime(row["deadline"], STORED_DATETIME_FORMAT)
             day_label = _relative_day_label(deadline_dt, now)
@@ -64,7 +65,7 @@ async def build_agenda_message(user_id: str) -> str:
         entries.append(
             (
                 sort_dt,
-                f"  [作业] #{row['id']} [{course_label}] {row['description']}{visibility_label}"
+                f"  [作业] #{row.get('display_id', row['id'])} [{course_label}] {row['description']}{visibility_label}"
                 f" — {day_label} {time_label}".rstrip(),
             )
         )

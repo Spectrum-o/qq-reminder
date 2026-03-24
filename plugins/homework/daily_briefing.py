@@ -8,10 +8,11 @@ from nonebot.log import logger
 require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler  # noqa: E402
 
+from .assignment_service import list_pending_rows_with_display_ids  # noqa: E402
 from .config import OWNER_QQ  # noqa: E402
 from .course_parser import build_course_key_selector_map, get_all_courses  # noqa: E402
 from .course_reminder import get_today_schedule_for_user  # noqa: E402
-from .database import get_users_for_briefing_time, list_pending, list_pending_custom_reminders  # noqa: E402
+from .database import get_users_for_briefing_time, list_pending_custom_reminders  # noqa: E402
 from .models import STORED_DATETIME_FORMAT  # noqa: E402
 
 WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
@@ -47,7 +48,7 @@ async def build_daily_briefing(user_id: str) -> str:
         lines.append("今日无课程")
 
     # ── 近 3 天截止作业（按用户完成状态过滤）──
-    rows = await list_pending(user_id)
+    rows = await list_pending_rows_with_display_ids(user_id)
     cutoff = now + timedelta(days=3)
     upcoming = []
     for row in rows:
@@ -68,7 +69,7 @@ async def build_daily_briefing(user_id: str) -> str:
                 else row["course"]
             )
             upcoming.append(
-                f"  #{row['id']} [{course_label}] {row['description']}"
+                f"  #{row.get('display_id', row['id'])} [{course_label}] {row['description']}"
                 f" — {day_label} {time_str}"
             )
 

@@ -110,6 +110,30 @@ async def _ensure_user_course_subscriptions_schema(db: aiosqlite.Connection) -> 
     await db.execute("DROP TABLE user_course_subscriptions_legacy")
 
 
+async def _ensure_user_assignment_alias_schema(db: aiosqlite.Connection) -> None:
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_assignment_aliases (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id       TEXT NOT NULL,
+            assignment_id INTEGER NOT NULL,
+            display_id    INTEGER NOT NULL,
+            created_at    TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+            UNIQUE(user_id, assignment_id),
+            UNIQUE(user_id, display_id)
+        )
+        """
+    )
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_assignment_display_counters (
+            user_id         TEXT PRIMARY KEY,
+            next_display_id INTEGER NOT NULL DEFAULT 1
+        )
+        """
+    )
+
+
 def _is_precise_course_key(course_key: str | None) -> bool:
     return bool(course_key) and not course_key.startswith("legacy:")
 
@@ -271,6 +295,7 @@ async def init_db() -> None:
             """
         )
         await _ensure_user_course_subscriptions_schema(db)
+        await _ensure_user_assignment_alias_schema(db)
 
         # ── Column migrations ──
 
@@ -346,6 +371,12 @@ async def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_user_completions_assignment ON user_completions(assignment_id)"
         )
         await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_assignment_aliases_user ON user_assignment_aliases(user_id, display_id)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_assignment_aliases_assignment ON user_assignment_aliases(assignment_id)"
+        )
+        await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_user_subscriptions_user ON user_course_subscriptions(user_id)"
         )
         await db.execute(
@@ -391,6 +422,105 @@ async def get_assignment(assignment_id: int) -> dict | None:
         ) as cursor:
             row = await cursor.fetchone()
             return dict(row) if row else None
+
+
+async def _get_next_assignment_display_id(
+    db: aiosqlite.Connection, user_id: str
+) -> int:
+    async with db.execute(
+        "SELECT next_display_id FROM user_assignment_display_counters WHERE user_id = ?",
+        (user_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    if row is not None:
+        return int(row[0])
+
+    async with db.execute(
+        "SELECT COALESCE(MAX(display_id), 0) + 1 FROM user_assignment_aliases WHERE user_id = ?",
+        (user_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    next_display_id = int(row[0]) if row and row[0] is not None else 1
+    await db.execute(
+        """
+        INSERT INTO user_assignment_display_counters (user_id, next_display_id)
+        VALUES (?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET next_display_id = excluded.next_display_id
+        """,
+        (user_id, next_display_id),
+    )
+    return next_display_id
+
+
+async def ensure_assignment_display_ids(
+    user_id: str, assignment_ids: list[int]
+) -> dict[int, int]:
+    unique_ids = sorted({int(assignment_id) for assignment_id in assignment_ids if assignment_id})
+    if not unique_ids:
+        return {}
+
+    placeholders = ",".join("?" for _ in unique_ids)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute(
+            f"""
+            SELECT assignment_id, display_id
+            FROM user_assignment_aliases
+            WHERE user_id = ?
+              AND assignment_id IN ({placeholders})
+            """,
+            [user_id, *unique_ids],
+        ) as cursor:
+            mapping = {
+                int(row["assignment_id"]): int(row["display_id"])
+                async for row in cursor
+            }
+
+        missing_ids = [assignment_id for assignment_id in unique_ids if assignment_id not in mapping]
+        if missing_ids:
+            next_display_id = await _get_next_assignment_display_id(db, user_id)
+            for assignment_id in missing_ids:
+                await db.execute(
+                    """
+                    INSERT INTO user_assignment_aliases (user_id, assignment_id, display_id)
+                    VALUES (?, ?, ?)
+                    """,
+                    (user_id, assignment_id, next_display_id),
+                )
+                mapping[assignment_id] = next_display_id
+                next_display_id += 1
+            await db.execute(
+                """
+                INSERT INTO user_assignment_display_counters (user_id, next_display_id)
+                VALUES (?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET next_display_id = excluded.next_display_id
+                """,
+                (user_id, next_display_id),
+            )
+
+        await db.commit()
+        return mapping
+
+
+async def get_assignment_display_id(user_id: str, assignment_id: int) -> int | None:
+    return (await ensure_assignment_display_ids(user_id, [assignment_id])).get(assignment_id)
+
+
+async def resolve_assignment_id_for_display_id(
+    user_id: str, display_id: int
+) -> int | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT assignment_id
+            FROM user_assignment_aliases
+            WHERE user_id = ? AND display_id = ?
+            """,
+            (user_id, display_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return int(row[0]) if row else None
 
 
 async def list_pending(user_id: str) -> list[dict]:
@@ -516,6 +646,7 @@ async def delete_assignment(assignment_id: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute("DELETE FROM assignments WHERE id = ?", (assignment_id,))
         await db.execute("DELETE FROM user_completions WHERE assignment_id = ?", (assignment_id,))
+        await db.execute("DELETE FROM user_assignment_aliases WHERE assignment_id = ?", (assignment_id,))
         await db.commit()
         return cursor.rowcount > 0
 
@@ -609,6 +740,10 @@ async def sync_source_assignments(
             if source_key and source_key not in desired_keys:
                 await db.execute(
                     "DELETE FROM user_completions WHERE assignment_id = ?",
+                    (row["id"],),
+                )
+                await db.execute(
+                    "DELETE FROM user_assignment_aliases WHERE assignment_id = ?",
                     (row["id"],),
                 )
                 cursor = await db.execute(
@@ -970,6 +1105,10 @@ async def delete_assignments_by_course(
             placeholders = ",".join("?" for _ in ids)
             await db.execute(
                 f"DELETE FROM user_completions WHERE assignment_id IN ({placeholders})",
+                ids,
+            )
+            await db.execute(
+                f"DELETE FROM user_assignment_aliases WHERE assignment_id IN ({placeholders})",
                 ids,
             )
             await db.execute(
@@ -1391,6 +1530,10 @@ async def delete_user(qq_id: str) -> bool:
                 assignment_ids,
             )
             await db.execute(
+                f"DELETE FROM user_assignment_aliases WHERE assignment_id IN ({placeholders})",
+                assignment_ids,
+            )
+            await db.execute(
                 f"""
                 DELETE FROM reminders
                 WHERE type = 'homework' AND ref_id IN ({reminder_placeholders})
@@ -1403,6 +1546,8 @@ async def delete_user(qq_id: str) -> bool:
             )
 
         await db.execute("DELETE FROM user_completions WHERE user_id = ?", (qq_id,))
+        await db.execute("DELETE FROM user_assignment_aliases WHERE user_id = ?", (qq_id,))
+        await db.execute("DELETE FROM user_assignment_display_counters WHERE user_id = ?", (qq_id,))
         await db.execute("DELETE FROM user_course_subscriptions WHERE user_id = ?", (qq_id,))
         await db.execute("DELETE FROM reminders WHERE user_id = ?", (qq_id,))
         await db.commit()

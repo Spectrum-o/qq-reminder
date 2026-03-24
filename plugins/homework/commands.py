@@ -9,12 +9,12 @@ from nonebot.adapters.onebot.v11 import Bot, PrivateMessageEvent, Message
 
 from .assignment_service import (
     add_manual_assignment,
-    complete_assignment,
+    complete_assignment_by_display_id,
     format_stats,
+    get_assignment_display_id_for_user,
     list_pending_message,
     parse_command_deadline,
-    remove_assignment,
-    remove_assignment_checked,
+    remove_assignment_checked_by_display_id,
     sync_homework_reminders_for_user,
 )
 from .agenda_service import build_agenda_message
@@ -255,7 +255,7 @@ async def handle_quick_done(bot: Bot, event: PrivateMessageEvent):
     if not user_id:
         await quick_done.finish(_PENDING_MSG)
     aid = int(event.get_plaintext().strip())
-    ok = await complete_assignment(user_id, aid)
+    ok = await complete_assignment_by_display_id(user_id, aid)
     if ok:
         await quick_done.finish(f"作业 #{aid} 已完成!")
     else:
@@ -287,7 +287,7 @@ async def handle_quick_delete(bot: Bot, event: PrivateMessageEvent):
         await quick_delete.finish("格式错误，请输入 x<编号>")
     aid = int(m.group())
     is_admin = await is_admin_or_above(user_id)
-    error = await remove_assignment_checked(aid, user_id, is_admin)
+    error = await remove_assignment_checked_by_display_id(aid, user_id, is_admin)
     if error:
         await quick_delete.finish(error)
     else:
@@ -358,9 +358,11 @@ async def handle_add(bot: Bot, event: PrivateMessageEvent, args: Message = Comma
         owner_id=user_id,
         course_key=course.course_key,
     )
+    display_id = await get_assignment_display_id_for_user(user_id, aid)
     label = "公共" if visibility == "public" else "私人"
+    shown_id = display_id if display_id is not None else aid
     await add_cmd.finish(
-        f"已添加{label}作业 #{aid}: [{course_selector}] {desc}\n截止: {deadline_iso}"
+        f"已添加{label}作业 #{shown_id}: [{course_selector}] {desc}\n截止: {deadline_iso}"
     )
 
 
@@ -402,7 +404,7 @@ async def handle_done(bot: Bot, event: PrivateMessageEvent, args: Message = Comm
     text = args.extract_plain_text().strip()
     if not text.isdigit():
         await done_cmd.finish("格式: /done <编号>\n例: /done 3")
-    ok = await complete_assignment(user_id, int(text))
+    ok = await complete_assignment_by_display_id(user_id, int(text))
     if ok:
         await done_cmd.finish(f"作业 #{text} 已标记完成!")
     else:
@@ -422,7 +424,7 @@ async def handle_delete(bot: Bot, event: PrivateMessageEvent, args: Message = Co
     if not text.isdigit():
         await del_cmd.finish("格式: /delete <编号>\n例: /delete 5")
     is_admin = await is_admin_or_above(user_id)
-    error = await remove_assignment_checked(int(text), user_id, is_admin)
+    error = await remove_assignment_checked_by_display_id(int(text), user_id, is_admin)
     if error:
         await del_cmd.finish(error)
     else:
