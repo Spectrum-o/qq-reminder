@@ -383,6 +383,7 @@ LLM 会自动识别意图并执行对应操作。普通用户可以查看事项�
         "start_date": "2026-03-13",
         "time": "23:59",
         "interval_days": 7,
+        "release_after_class": "last",
         "generate_days_ahead": 14,
         "end_date": "2026-06-26"
     }
@@ -397,8 +398,13 @@ LLM 会自动识别意图并执行对应操作。普通用户可以查看事项�
 | `start_date` | 第一次截止日期 `YYYY-MM-DD` |
 | `time` | 每次截止时间 `HH:MM` |
 | `interval_days` | 间隔天数（`7` = 每周一次） |
+| `release_after_class` | 可选。作业在本周期第几次上课后才生成；支持 `1`、`2`、`first`、`last` |
 | `generate_days_ahead` | 提前多少天生成 |
 | `end_date` | 可选，结束日期 |
+
+- 如果配置了 `release_after_class`，周期作业不会在窗口一开始就出现，而是等该课程本周期对应的那次课结束后才生成。
+- 当一周内同一课程有多次课时，`1`/`first` 表示第一节后出现，`last` 表示最后一节后出现；如果填 `2` 但该周期实际只匹配到 1 节课，则会退化为“最后一节课后”。
+- 课后解锁依赖 `config.json` 的课表配置。建议同时维护 `period_end_times`；若未提供，会使用默认下课时间。
 
 ---
 

@@ -91,7 +91,7 @@ def format_recurring_rules(now: datetime | None = None) -> str:
             f"  {rule.rule_id} [{rule.course}] 每{rule.interval_days}天一次"
         )
         lines.append(
-            f"    下一次: {next_text}  提前生成: {rule.generate_days_ahead}天  结束: {end_text}"
+            f"    下一次: {next_text}  提前生成: {rule.generate_days_ahead}天  解锁: {rule.release_summary()}  结束: {end_text}"
         )
         lines.append(f"    模板: {rule.description_template}")
     return "\n".join(lines)

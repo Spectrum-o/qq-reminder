@@ -6,6 +6,7 @@
         "start_date": "2026-03-13",
         "time": "23:59",
         "interval_days": 7,
+        "release_after_class": "last",
         "generate_days_ahead": 14,
         "end_date": "2026-06-26"
     }
