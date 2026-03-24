@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime
-from unittest.mock import patch
-
 from plugins.homework import llm_handler
 from plugins.homework.assignment_service import list_pending_message
-from plugins.homework.llm_service import _execute_tool
+from plugins.homework.llm_service import _build_system_prompt, _execute_tool
+from plugins.homework.database import list_pending_custom_reminders
 from plugins.homework.user_service import subscribe_courses
 
 
@@ -20,12 +18,6 @@ def _write_public_course(course_file, course_id: str = "sd101", name: str = "计
         + "\n",
         encoding="utf-8",
     )
-
-
-class _FrozenDateTime(datetime):
-    @classmethod
-    def now(cls, tz=None):
-        return cls(2026, 3, 24, 10, 0, tzinfo=tz)
 
 
 class TestLlmAssignmentActions:
@@ -90,20 +82,46 @@ class TestLlmAssignmentActions:
         pending = await list_pending_message("user1")
         assert "[计算理论] 纸质作 1.4a, 1.5c [私]" in pending
 
-    async def test_add_assignment_accepts_this_week_deadline_phrase(self, env_with_users):
+    async def test_add_assignment_rejects_nonstandard_deadline_format(self, env_with_users):
         _write_public_course(env_with_users["course_file"])
         await subscribe_courses("user1", ["计算理论"])
 
-        with patch("plugins.homework.time_parser.datetime", _FrozenDateTime):
-            result = await _execute_tool(
-                "add_assignment",
-                {
-                    "course": "计算理论",
-                    "deadline": "这周四之前",
-                    "description": "纸质作 2.1",
-                },
-                "user1",
-                "user",
-            )
+        result = await _execute_tool(
+            "add_assignment",
+            {
+                "course": "计算理论",
+                "deadline": "这周四之前",
+                "description": "纸质作 2.1",
+            },
+            "user1",
+            "user",
+        )
 
-        assert "截止: 2026-03-26 23:59" in result
+        assert result == "截止时间格式错误，请使用 YYYY-MM-DD HH:MM，例如 2026-03-27 23:59"
+
+    async def test_add_custom_reminder_requires_standard_datetime(self, env_with_users):
+        result = await _execute_tool(
+            "add_custom_reminder",
+            {"title": "开会", "remind_at": "明天下午三点"},
+            "user1",
+            "user",
+        )
+
+        assert result == "提醒时间格式错误，请使用 YYYY-MM-DD HH:MM，例如 2026-03-25 15:00"
+        assert await list_pending_custom_reminders("user1") == []
+
+    async def test_add_custom_reminder_accepts_standard_datetime(self, env_with_users):
+        result = await _execute_tool(
+            "add_custom_reminder",
+            {"title": "开会", "remind_at": "2026-03-25 15:00"},
+            "user1",
+            "user",
+        )
+
+        assert result == "已设置提醒: 开会 (2026-03-25 15:00)"
+
+    def test_llm_prompt_requires_standard_datetime_for_actions(self):
+        prompt = _build_system_prompt("上下文", use_json_fallback=True, role="user")
+
+        assert "必须使用 YYYY-MM-DD HH:MM 绝对时间格式" in prompt
+        assert "不要把 明天、这周四之前、下周一上午" in prompt

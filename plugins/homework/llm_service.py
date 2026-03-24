@@ -36,7 +36,6 @@ from .database import (
 )
 from .models import ReminderDraft, STORED_DATETIME_FORMAT
 from .public_info import PUBLIC_BOT_GUIDE
-from .time_parser import parse_natural_deadline
 from .user_service import (
     ROLE_ADMIN,
     ROLE_ROOT,
@@ -97,7 +96,13 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "course": {"type": "string", "description": "课程名称"},
-                    "deadline": {"type": "string", "description": "截止时间，自然语言如 明天、下周五18:00、4月15日"},
+                    "deadline": {
+                        "type": "string",
+                        "description": (
+                            "截止时间，必须是 YYYY-MM-DD HH:MM 格式。"
+                            "用户可以说自然语言，但你必须先换算成标准时间再调用。"
+                        ),
+                    },
                     "description": {"type": "string", "description": "作业描述"},
                 },
                 "required": ["course", "deadline", "description"],
@@ -157,7 +162,13 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "title": {"type": "string", "description": "提醒内容"},
-                    "remind_at": {"type": "string", "description": "提醒时间，自然语言如 明天15:00、下周一9:00"},
+                    "remind_at": {
+                        "type": "string",
+                        "description": (
+                            "提醒时间，必须是 YYYY-MM-DD HH:MM 格式。"
+                            "用户可以说自然语言，但你必须先换算成标准时间再调用。"
+                        ),
+                    },
                 },
                 "required": ["title", "remind_at"],
             },
@@ -318,7 +329,7 @@ ACTION: {"action": "<动作名>", "args": {<参数>}}
 可用动作及其参数（必须严格使用下列参数名）:
 
 1. add_custom_reminder - 设置提醒
-   args: {"title": "提醒内容", "remind_at": "自然语言时间，如 今天17:00、明天15:00、下周一9:00"}
+   args: {"title": "提醒内容", "remind_at": "YYYY-MM-DD HH:MM"}
 
 2. complete_assignment - 标记作业完成
    args: {"assignment_id": 编号}
@@ -345,7 +356,7 @@ ACTION: {"action": "<动作名>", "args": {<参数>}}
    args: {"reminder_id": 编号}
 
 10. add_assignment - 添加作业（管理员=公共, 普通用户=私人）
-   args: {"course": "课程名", "deadline": "截止时间", "description": "描述"}
+   args: {"course": "课程名", "deadline": "YYYY-MM-DD HH:MM", "description": "描述"}
 
 11. delete_assignment - 删除作业（管理员删公共, 用户删自己的私人）
    args: {"assignment_id": 编号}
@@ -379,17 +390,21 @@ ACTION: {"action": "<动作名>", "args": {<参数>}}
     - root 可以审批为 user 或 admin
 
 示例:
-用户: 明天下午3点提醒我开会
-回复: 好的，我帮你设置明天下午3点的开会提醒。
-ACTION: {"action": "add_custom_reminder", "args": {"title": "开会", "remind_at": "明天15:00"}}
+用户: 4月15日下午3点提醒我开会
+回复: 好的，我帮你设置 4 月 15 日下午 3 点的开会提醒。
+ACTION: {"action": "add_custom_reminder", "args": {"title": "开会", "remind_at": "2026-04-15 15:00"}}
 
-用户: 我下午5点要去拿快递，记得提醒我
-回复: 没问题，下午5点我会提醒你去拿快递。
-ACTION: {"action": "add_custom_reminder", "args": {"title": "拿快递", "remind_at": "今天17:00"}}
+用户: 4月16日下午5点提醒我拿快递
+回复: 没问题，4 月 16 日下午 5 点我会提醒你去拿快递。
+ACTION: {"action": "add_custom_reminder", "args": {"title": "拿快递", "remind_at": "2026-04-16 17:00"}}
 
 用户: 我的作业有哪些
 回复:
 ACTION: {"action": "list_assignments", "args": {}}
+
+用户: 计算理论4月17日23:59前交纸质作 1.4a
+回复: 好的，我帮你记下这条作业。
+ACTION: {"action": "add_assignment", "args": {"course": "计算理论", "deadline": "2026-04-17 23:59", "description": "纸质作 1.4a"}}
 
 用户: 我的早报几点发
 回复:
@@ -440,6 +455,8 @@ ACTION: {"action": "approve_user", "args": {"qq_id": "123456789", "role": "user"
 重要: args 里的参数名必须严格使用上面列出的名称（如 title、remind_at、time_slots），不要用其他名称。
 重要: add_assignment 只用于新增作业；如果用户是在问是否支持、怎么用，或是在修改已有作业，不要输出 ACTION。
 重要: 如果新增作业缺课程、截止时间、作业内容中的任一项，先追问，不要输出带空字符串的 ACTION。
+重要: add_assignment.deadline 和 add_custom_reminder.remind_at 必须是 YYYY-MM-DD HH:MM。
+重要: 不要把 明天、这周四之前、下周一上午 这种自然语言直接放进 ACTION；必须先换算成标准时间。
 
 如果不需要执行操作（纯聊天或回答问题），直接用自然语言回复即可，不要附 ACTION 行。
 """.strip()
@@ -471,6 +488,18 @@ def _format_add_assignment_usage() -> str:
         "添加作业需要课程、截止时间和作业内容。"
         "直接发一句就行，比如：计算理论这周四之前交纸质作 1.4a。"
     )
+
+
+def _parse_llm_datetime(raw: str, field_label: str, example: str) -> tuple[str | None, str | None]:
+    value = str(raw).strip()
+    if not value:
+        return None, f"{field_label}格式错误，请使用 YYYY-MM-DD HH:MM，例如 {example}"
+
+    try:
+        dt = datetime.strptime(value, STORED_DATETIME_FORMAT)
+    except ValueError:
+        return None, f"{field_label}格式错误，请使用 YYYY-MM-DD HH:MM，例如 {example}"
+    return dt.strftime(STORED_DATETIME_FORMAT), None
 
 
 def _parse_briefing_value(raw: str) -> tuple[str, int | None, int | None] | None:
@@ -523,6 +552,9 @@ def _build_system_prompt(context: str, use_json_fallback: bool, role: str | None
         "才能使用 add_assignment；如果用户是在问能不能加、怎么加，直接解释用法，不要输出 ACTION。\n"
         "如果用户是在修改已有作业或修改截止时间，不要使用 add_assignment；"
         "明确说明当前不能直接修改已有作业，并建议先删除旧作业再重新添加。\n"
+        "当你输出 add_assignment.deadline 或 add_custom_reminder.remind_at 时，"
+        "必须使用 YYYY-MM-DD HH:MM 绝对时间格式；不要输出 明天、周五、这周四之前 这类自然语言。\n"
+        "如果你无法把时间唯一换算成标准时间，就先追问，不要输出模糊时间。\n"
         "涉及每日早报时间或开关时，不要当成普通提醒，优先使用 get_briefing_settings 或 set_briefing_time；"
         "如果用户只说想修改早报但没给目标时间，可以先追问具体时间。\n"
         "涉及课程操作时，优先使用当前上下文里的精确课程名；"
@@ -701,10 +733,13 @@ async def _execute_tool(name: str, args: dict, user_id: str, role: str | None) -
             description = str(args.get("description", "")).strip()
             if not course_name or not deadline_text or not description:
                 return _format_add_assignment_usage()
-            try:
-                deadline_iso = parse_natural_deadline(deadline_text)
-            except ValueError:
-                return f"无法识别截止时间: {deadline_text}"
+            deadline_iso, error = _parse_llm_datetime(
+                deadline_text,
+                "截止时间",
+                "2026-03-27 23:59",
+            )
+            if error:
+                return error
             course = resolve_visible_course(user_id, course_name)
             if course is None:
                 return (
@@ -780,10 +815,13 @@ async def _execute_tool(name: str, args: dict, user_id: str, role: str | None) -
             title = args.get("title") or args.get("content") or args.get("message") or ""
             if not time_str or not title:
                 return "请提供提醒时间和内容"
-            try:
-                remind_at = parse_natural_deadline(time_str)
-            except ValueError:
-                return f"无法识别提醒时间: {time_str}"
+            remind_at, error = _parse_llm_datetime(
+                time_str,
+                "提醒时间",
+                "2026-03-25 15:00",
+            )
+            if error:
+                return error
             await add_reminder(
                 ReminderDraft(
                     type="custom",
