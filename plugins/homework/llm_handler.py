@@ -23,6 +23,12 @@ from .config import (
     LLM_USER_RATE_LIMIT_WINDOW_SECONDS,
 )
 from .agenda_service import build_agenda_message
+from .assignment_service import (
+    complete_assignment_by_display_id,
+    remove_assignment_checked_by_display_id,
+    validate_completion_reference,
+    validate_delete_reference,
+)
 from .course_service import format_today_schedule_for_user
 from .public_info import (
     get_local_public_reply,
@@ -77,6 +83,21 @@ _ASSIGNMENT_UPDATE_TOKENS = (
     "推迟",
     "提前",
     "变更",
+)
+_ASSIGNMENT_ID_RE = re.compile(r"#?\d+")
+_ASSIGNMENT_DELETE_PATTERNS = (
+    re.compile(r"(?:删除|删掉|删了|移除)\s*(?:作业)?\s*([第个号作业#\d\s,，、和及]+)"),
+    re.compile(
+        r"(?:把)?\s*(?:作业)?\s*([第个号作业#\d\s,，、和及]+)\s*(?:删除|删掉|删了|移除)"
+    ),
+)
+_ASSIGNMENT_COMPLETE_PATTERNS = (
+    re.compile(
+        r"(?:标记完成|标完成|完成|做完|搞定)\s*(?:作业)?\s*([第个号作业#\d\s,，、和及]+)"
+    ),
+    re.compile(
+        r"(?:把)?\s*(?:作业)?\s*([第个号作业#\d\s,，、和及]+)\s*(?:标记完成|标完成|完成|做完|搞定)"
+    ),
 )
 
 
@@ -281,6 +302,68 @@ async def _try_handle_local_assignment_message(text: str) -> str | None:
     return None
 
 
+def _extract_assignment_display_ids(
+    text: str, patterns: tuple[re.Pattern[str], ...]
+) -> list[int]:
+    normalized = text.strip()
+    for pattern in patterns:
+        match = pattern.search(normalized)
+        if match is None:
+            continue
+        raw_ids = [
+            int(token.lstrip("#"))
+            for token in _ASSIGNMENT_ID_RE.findall(match.group(1))
+        ]
+        if raw_ids:
+            return list(dict.fromkeys(raw_ids))
+    return []
+
+
+async def _try_handle_local_assignment_id_action(
+    text: str,
+    user_id: str,
+    role: str | None,
+) -> str | None:
+    delete_ids = _extract_assignment_display_ids(text, _ASSIGNMENT_DELETE_PATTERNS)
+    if delete_ids:
+        is_admin = role in (ROLE_ADMIN, ROLE_ROOT)
+        for display_id in delete_ids:
+            _assignment_id, _shown_id, error = await validate_delete_reference(
+                display_id, user_id, is_admin
+            )
+            if error:
+                return f"{error}，未执行删除"
+
+        for display_id in delete_ids:
+            error = await remove_assignment_checked_by_display_id(
+                display_id, user_id, is_admin
+            )
+            if error:
+                return f"{error}，删除已中止"
+
+        shown_ids = "、".join(f"#{display_id}" for display_id in delete_ids)
+        return f"已删除作业 {shown_ids}"
+
+    complete_ids = _extract_assignment_display_ids(text, _ASSIGNMENT_COMPLETE_PATTERNS)
+    if complete_ids:
+        for display_id in complete_ids:
+            _assignment_id, _shown_id, error = await validate_completion_reference(
+                user_id, display_id
+            )
+            if error:
+                return f"{error}，未执行完成操作"
+
+        for display_id in complete_ids:
+            ok = await complete_assignment_by_display_id(user_id, display_id)
+            if not ok:
+                return f"编号 #{display_id} 的作业处理失败，完成操作已中止"
+
+        shown_ids = "、".join(f"#{display_id}" for display_id in complete_ids)
+        return f"已完成作业 {shown_ids}"
+
+    return None
+
+
 async def _try_handle_local_briefing_message(
     text: str,
     user_id: str,
@@ -359,6 +442,12 @@ async def handle_llm_fallback(bot: Bot, event: PrivateMessageEvent):
     local_briefing_reply = await _try_handle_local_briefing_message(text, user_id, role)
     if local_briefing_reply:
         await llm_fallback.finish(local_briefing_reply)
+
+    local_assignment_id_reply = await _try_handle_local_assignment_id_action(
+        text, user_id, role
+    )
+    if local_assignment_id_reply:
+        await llm_fallback.finish(local_assignment_id_reply)
 
     local_assignment_reply = await _try_handle_local_assignment_message(text)
     if local_assignment_reply:

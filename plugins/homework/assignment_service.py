@@ -244,27 +244,14 @@ async def resolve_assignment_reference(
     assignment_id = await resolve_assignment_id_for_display_id(user_id, raw_display_id)
     if assignment_id is not None:
         return assignment_id, raw_display_id
-
-    assignment = await get_assignment(raw_display_id)
-    if assignment is None:
-        return None, None
-
-    subscription_keys = set(await get_subscriptions(user_id))
-    subscription_names = set(await get_subscription_names(user_id))
-    if not _is_assignment_visible_to_user(
-        assignment, user_id, subscription_keys, subscription_names
-    ):
-        return None, None
-
-    display_id = await get_assignment_display_id(user_id, raw_display_id)
-    return raw_display_id, display_id
+    return None, None
 
 
 async def complete_assignment_by_display_id(user_id: str, display_id: int) -> bool:
-    assignment_id, _resolved_display_id = await resolve_assignment_reference(
+    assignment_id, _resolved_display_id, error = await validate_completion_reference(
         user_id, display_id
     )
-    if assignment_id is None:
+    if error or assignment_id is None:
         return False
     return await complete_assignment(user_id, assignment_id)
 
@@ -341,14 +328,51 @@ async def remove_assignment_checked(
     return None
 
 
-async def remove_assignment_checked_by_display_id(
-    display_id: int, user_id: str, is_admin: bool
-) -> str | None:
+async def validate_completion_reference(
+    user_id: str, display_id: int
+) -> tuple[int | None, int | None, str | None]:
     assignment_id, resolved_display_id = await resolve_assignment_reference(
         user_id, display_id
     )
+    shown_id = resolved_display_id if resolved_display_id is not None else display_id
     if assignment_id is None:
-        return f"未找到编号 #{display_id} 的作业"
+        return None, None, f"未找到编号 #{display_id} 的待完成作业"
+    if await is_assignment_done_by(user_id, assignment_id):
+        return None, shown_id, f"未找到编号 #{shown_id} 的待完成作业"
+    return assignment_id, shown_id, None
+
+
+async def validate_delete_reference(
+    display_id: int, user_id: str, is_admin: bool
+) -> tuple[int | None, int | None, str | None]:
+    assignment_id, resolved_display_id = await resolve_assignment_reference(
+        user_id, display_id
+    )
+    shown_id = resolved_display_id if resolved_display_id is not None else display_id
+    if assignment_id is None:
+        return None, None, f"未找到编号 #{display_id} 的作业"
+
+    assignment = await get_assignment(assignment_id)
+    if not assignment:
+        return None, shown_id, f"未找到编号 #{shown_id} 的作业"
+
+    if assignment.get("visibility") == "private":
+        if assignment.get("owner_id") != user_id:
+            return None, shown_id, "你只能删除自己的私人作业"
+    elif not is_admin:
+        return None, shown_id, "只有管理员可以删除公共作业"
+
+    return assignment_id, shown_id, None
+
+
+async def remove_assignment_checked_by_display_id(
+    display_id: int, user_id: str, is_admin: bool
+) -> str | None:
+    assignment_id, resolved_display_id, error = await validate_delete_reference(
+        display_id, user_id, is_admin
+    )
+    if error or assignment_id is None:
+        return error or f"未找到编号 #{display_id} 的作业"
     return await remove_assignment_checked(
         assignment_id,
         user_id,

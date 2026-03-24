@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from plugins.homework import llm_handler
-from plugins.homework.assignment_service import list_pending_message
+from plugins.homework.assignment_service import add_manual_assignment, list_pending_message
 from plugins.homework.llm_service import _build_system_prompt, _execute_tool
 from plugins.homework.database import list_pending_custom_reminders
 from plugins.homework.user_service import subscribe_courses
@@ -49,6 +49,101 @@ class TestLlmAssignmentActions:
         )
 
         assert result is None
+
+    async def test_local_assignment_batch_delete_is_atomic(self, env_with_users):
+        _write_public_course(env_with_users["course_file"])
+        await subscribe_courses("user1", ["计算理论"])
+
+        await add_manual_assignment(
+            "计算理论",
+            "作业1",
+            "2026-03-27 23:59",
+            visibility="private",
+            owner_id="user1",
+            course_key="public:sd101",
+        )
+        await add_manual_assignment(
+            "计算理论",
+            "作业2",
+            "2026-03-28 23:59",
+            visibility="private",
+            owner_id="user1",
+            course_key="public:sd101",
+        )
+        await list_pending_message("user1")
+
+        result = await llm_handler._try_handle_local_assignment_id_action(
+            "删除作业3 2",
+            "user1",
+            "user",
+        )
+
+        assert result == "未找到编号 #3 的作业，未执行删除"
+        pending = await list_pending_message("user1")
+        assert "作业1 [私]" in pending
+        assert "作业2 [私]" in pending
+
+    async def test_local_assignment_batch_delete_deletes_all_requested_ids(
+        self, env_with_users
+    ):
+        _write_public_course(env_with_users["course_file"])
+        await subscribe_courses("user1", ["计算理论"])
+
+        for index in range(1, 4):
+            await add_manual_assignment(
+                "计算理论",
+                f"作业{index}",
+                f"2026-03-2{index} 23:59",
+                visibility="private",
+                owner_id="user1",
+                course_key="public:sd101",
+            )
+        await list_pending_message("user1")
+
+        result = await llm_handler._try_handle_local_assignment_id_action(
+            "把作业 3、2 删掉",
+            "user1",
+            "user",
+        )
+
+        assert result == "已删除作业 #3、#2"
+        pending = await list_pending_message("user1")
+        assert "#1  [计算理论] 作业1 [私]" in pending
+        assert "作业2" not in pending
+        assert "作业3" not in pending
+
+    async def test_local_assignment_batch_complete_marks_all_requested_ids(
+        self, env_with_users
+    ):
+        _write_public_course(env_with_users["course_file"])
+        await subscribe_courses("user1", ["计算理论"])
+
+        await add_manual_assignment(
+            "计算理论",
+            "作业1",
+            "2026-03-27 23:59",
+            visibility="private",
+            owner_id="user1",
+            course_key="public:sd101",
+        )
+        await add_manual_assignment(
+            "计算理论",
+            "作业2",
+            "2026-03-28 23:59",
+            visibility="private",
+            owner_id="user1",
+            course_key="public:sd101",
+        )
+        await list_pending_message("user1")
+
+        result = await llm_handler._try_handle_local_assignment_id_action(
+            "把第2和第1个作业标记完成",
+            "user1",
+            "user",
+        )
+
+        assert result == "已完成作业 #2、#1"
+        assert await list_pending_message("user1") == "没有待完成的作业!"
 
     async def test_add_assignment_rejects_empty_llm_args(self, env_with_users):
         result = await _execute_tool(

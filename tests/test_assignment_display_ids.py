@@ -8,6 +8,7 @@ from plugins.homework.assignment_service import (
     complete_assignment_by_display_id,
     get_assignment_display_id_for_user,
     list_pending_message,
+    resolve_assignment_reference,
 )
 from plugins.homework.user_service import subscribe_courses
 
@@ -110,3 +111,48 @@ class TestAssignmentDisplayIds:
         assert "回复 /done 2 标记完成" in bodies_by_user["user1"]
         assert "#1  [计算理论] 公共作业" in bodies_by_user["user2"]
         assert "回复 /done 1 标记完成" in bodies_by_user["user2"]
+
+    async def test_assignment_actions_only_accept_user_display_ids(self, env_with_users):
+        _write_public_course(env_with_users["course_file"])
+        await subscribe_courses("user1", ["计算理论"])
+
+        await add_manual_assignment(
+            "计算理论",
+            "可见作业1",
+            "2099-12-30 23:59",
+            visibility="public",
+            course_key="public:sd101",
+        )
+        await add_manual_assignment(
+            "Notes",
+            "隐藏作业1",
+            "2099-12-30 23:59",
+            visibility="private",
+            owner_id="user2",
+        )
+        await add_manual_assignment(
+            "Notes",
+            "隐藏作业2",
+            "2099-12-30 23:59",
+            visibility="private",
+            owner_id="user2",
+        )
+        visible_global_id = await add_manual_assignment(
+            "计算理论",
+            "可见作业2",
+            "2099-12-31 23:59",
+            visibility="public",
+            course_key="public:sd101",
+        )
+
+        pending = await list_pending_message("user1")
+        assert "#1  [计算理论] 可见作业1" in pending
+        assert "#2  [计算理论] 可见作业2" in pending
+
+        assert visible_global_id == 4
+        assert await resolve_assignment_reference("user1", visible_global_id) == (None, None)
+        assert await complete_assignment_by_display_id("user1", visible_global_id) is False
+
+        after = await list_pending_message("user1")
+        assert "#1  [计算理论] 可见作业1" in after
+        assert "#2  [计算理论] 可见作业2" in after
