@@ -23,12 +23,6 @@ from .config import (
     LLM_USER_RATE_LIMIT_WINDOW_SECONDS,
 )
 from .agenda_service import build_agenda_message
-from .assignment_service import (
-    complete_assignment_by_display_id,
-    remove_assignment_checked_by_display_id,
-    validate_completion_reference,
-    validate_delete_reference,
-)
 from .course_service import format_today_schedule_for_user
 from .public_info import (
     get_local_public_reply,
@@ -49,55 +43,6 @@ _pending_briefing_followups: dict[str, float] = {}
 _BRIEFING_FOLLOWUP_TTL_SECONDS = 300
 _BRIEFING_TIME_CANDIDATE_RE = re.compile(
     r"(\d{1,2}\s*[:：]\s*\d{1,2}|\d{1,2}\s*(?:点|时)(?:半|\d{1,2}分?)?)"
-)
-_ASSIGNMENT_TIME_HINT_RE = re.compile(
-    r"(今天|明天|后天|大后天|本周[一二三四五六日天]|这周[一二三四五六日天]"
-    r"|下周[一二三四五六日天]|周[一二三四五六日天]"
-    r"|\d{1,2}\s*[月/\.]\s*\d{1,2}"
-    r"|\d{4}\s*-\s*\d{1,2}\s*-\s*\d{1,2}"
-    r"|\d{1,2}\s*[:：]\s*\d{1,2}"
-    r"|截止|之前|ddl|deadline|上午|中午|下午|晚上|今晚)"
-)
-_ASSIGNMENT_CAPABILITY_TOKENS = (
-    "我可以",
-    "可不可以",
-    "能不能",
-    "能否",
-    "怎么",
-    "如何",
-    "支持",
-    "行不行",
-    "可以吗",
-)
-_ASSIGNMENT_ADD_TOKENS = ("添加", "加", "记", "记录", "录入", "创建")
-_ASSIGNMENT_UPDATE_TOKENS = (
-    "修改",
-    "改成",
-    "改到",
-    "改下",
-    "改一下",
-    "调整",
-    "更新",
-    "延期",
-    "延后",
-    "推迟",
-    "提前",
-    "变更",
-)
-_ASSIGNMENT_ID_RE = re.compile(r"#?\d+")
-_ASSIGNMENT_DELETE_PATTERNS = (
-    re.compile(r"(?:删除|删掉|删了|移除)\s*(?:作业)?\s*([第个号作业#\d\s,，、和及]+)"),
-    re.compile(
-        r"(?:把)?\s*(?:作业)?\s*([第个号作业#\d\s,，、和及]+)\s*(?:删除|删掉|删了|移除)"
-    ),
-)
-_ASSIGNMENT_COMPLETE_PATTERNS = (
-    re.compile(
-        r"(?:标记完成|标完成|完成|做完|搞定)\s*(?:作业)?\s*([第个号作业#\d\s,，、和及]+)"
-    ),
-    re.compile(
-        r"(?:把)?\s*(?:作业)?\s*([第个号作业#\d\s,，、和及]+)\s*(?:标记完成|标完成|完成|做完|搞定)"
-    ),
 )
 
 
@@ -264,106 +209,6 @@ def _is_briefing_update_intent(text: str) -> bool:
     )
 
 
-def _is_assignment_capability_query(text: str) -> bool:
-    normalized = text.strip()
-    if "作业" not in normalized:
-        return False
-    if not any(token in normalized for token in _ASSIGNMENT_ADD_TOKENS):
-        return False
-    if not any(token in normalized for token in _ASSIGNMENT_CAPABILITY_TOKENS):
-        return False
-    return _ASSIGNMENT_TIME_HINT_RE.search(normalized) is None
-
-
-def _is_assignment_update_intent(text: str) -> bool:
-    normalized = text.strip()
-    if not any(token in normalized for token in ("作业", "截止", "ddl", "deadline")):
-        return False
-    return any(token in normalized for token in _ASSIGNMENT_UPDATE_TOKENS)
-
-
-async def _try_handle_local_assignment_message(text: str) -> str | None:
-    normalized = text.strip()
-    if not normalized:
-        return None
-
-    if _is_assignment_capability_query(normalized):
-        return (
-            "可以。直接发“课程名 + 截止时间 + 作业内容”就行，"
-            "比如“计算理论这周四之前交纸质作 1.4a”。"
-        )
-
-    if _is_assignment_update_intent(normalized):
-        return (
-            "我现在还不会直接修改已有作业，避免误加成一条新作业。"
-            "先 /list 看编号，删掉原作业后再把新的截止时间和内容发给我。"
-        )
-
-    return None
-
-
-def _extract_assignment_display_ids(
-    text: str, patterns: tuple[re.Pattern[str], ...]
-) -> list[int]:
-    normalized = text.strip()
-    for pattern in patterns:
-        match = pattern.search(normalized)
-        if match is None:
-            continue
-        raw_ids = [
-            int(token.lstrip("#"))
-            for token in _ASSIGNMENT_ID_RE.findall(match.group(1))
-        ]
-        if raw_ids:
-            return list(dict.fromkeys(raw_ids))
-    return []
-
-
-async def _try_handle_local_assignment_id_action(
-    text: str,
-    user_id: str,
-    role: str | None,
-) -> str | None:
-    delete_ids = _extract_assignment_display_ids(text, _ASSIGNMENT_DELETE_PATTERNS)
-    if delete_ids:
-        is_admin = role in (ROLE_ADMIN, ROLE_ROOT)
-        for display_id in delete_ids:
-            _assignment_id, _shown_id, error = await validate_delete_reference(
-                display_id, user_id, is_admin
-            )
-            if error:
-                return f"{error}，未执行删除"
-
-        for display_id in delete_ids:
-            error = await remove_assignment_checked_by_display_id(
-                display_id, user_id, is_admin
-            )
-            if error:
-                return f"{error}，删除已中止"
-
-        shown_ids = "、".join(f"#{display_id}" for display_id in delete_ids)
-        return f"已删除作业 {shown_ids}"
-
-    complete_ids = _extract_assignment_display_ids(text, _ASSIGNMENT_COMPLETE_PATTERNS)
-    if complete_ids:
-        for display_id in complete_ids:
-            _assignment_id, _shown_id, error = await validate_completion_reference(
-                user_id, display_id
-            )
-            if error:
-                return f"{error}，未执行完成操作"
-
-        for display_id in complete_ids:
-            ok = await complete_assignment_by_display_id(user_id, display_id)
-            if not ok:
-                return f"编号 #{display_id} 的作业处理失败，完成操作已中止"
-
-        shown_ids = "、".join(f"#{display_id}" for display_id in complete_ids)
-        return f"已完成作业 {shown_ids}"
-
-    return None
-
-
 async def _try_handle_local_briefing_message(
     text: str,
     user_id: str,
@@ -442,16 +287,6 @@ async def handle_llm_fallback(bot: Bot, event: PrivateMessageEvent):
     local_briefing_reply = await _try_handle_local_briefing_message(text, user_id, role)
     if local_briefing_reply:
         await llm_fallback.finish(local_briefing_reply)
-
-    local_assignment_id_reply = await _try_handle_local_assignment_id_action(
-        text, user_id, role
-    )
-    if local_assignment_id_reply:
-        await llm_fallback.finish(local_assignment_id_reply)
-
-    local_assignment_reply = await _try_handle_local_assignment_message(text)
-    if local_assignment_reply:
-        await llm_fallback.finish(local_assignment_reply)
 
     allowed, deny_message = _allow_llm_request(user_id, _USER_POLICY)
     if not allowed:

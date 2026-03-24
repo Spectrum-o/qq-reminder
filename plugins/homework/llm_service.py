@@ -17,6 +17,8 @@ from .assignment_service import (
     list_pending_message,
     remove_assignment_checked_by_display_id,
     sync_homework_reminders_for_user,
+    validate_completion_reference,
+    validate_delete_reference,
 )
 from .config import LLM_API_BASE, LLM_API_KEY, LLM_MODEL
 from .course_parser import add_custom_course, delete_custom_course, is_valid_time_slots
@@ -112,28 +114,42 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "complete_assignment",
-            "description": "标记某条作业为已完成。",
+            "name": "complete_assignments",
+            "description": (
+                "标记一条或多条作业为已完成。"
+                "用户说“完成 3 和 4”“把最后两条作业标记完成”时调用。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "assignment_id": {"type": "integer", "description": "用户当前 /list 里看到的作业编号"},
+                    "assignment_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "用户当前 /list 里看到的作业编号数组，按用户提及顺序填写",
+                    },
                 },
-                "required": ["assignment_id"],
+                "required": ["assignment_ids"],
             },
         },
     },
     {
         "type": "function",
         "function": {
-            "name": "delete_assignment",
-            "description": "删除某条作业。",
+            "name": "delete_assignments",
+            "description": (
+                "删除一条或多条作业。"
+                "用户说“删除 3 4 2”“把第 1 个和第 2 个作业删掉”时调用。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "assignment_id": {"type": "integer", "description": "用户当前 /list 里看到的作业编号"},
+                    "assignment_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "用户当前 /list 里看到的作业编号数组，按用户提及顺序填写",
+                    },
                 },
-                "required": ["assignment_id"],
+                "required": ["assignment_ids"],
             },
         },
     },
@@ -331,8 +347,8 @@ ACTION: {"action": "<动作名>", "args": {<参数>}}
 1. add_custom_reminder - 设置提醒
    args: {"title": "提醒内容", "remind_at": "YYYY-MM-DD HH:MM"}
 
-2. complete_assignment - 标记作业完成
-   args: {"assignment_id": 编号}
+2. complete_assignments - 标记一条或多条作业完成
+   args: {"assignment_ids": [编号1, 编号2]}
 
 3. list_agenda - 查看统一事项总览
    args: {}
@@ -358,8 +374,8 @@ ACTION: {"action": "<动作名>", "args": {<参数>}}
 10. add_assignment - 添加作业（管理员=公共, 普通用户=私人）
    args: {"course": "课程名", "deadline": "YYYY-MM-DD HH:MM", "description": "描述"}
 
-11. delete_assignment - 删除作业（管理员删公共, 用户删自己的私人）
-   args: {"assignment_id": 编号}
+11. delete_assignments - 删除一条或多条作业（管理员删公共, 用户删自己的私人）
+   args: {"assignment_ids": [编号1, 编号2]}
 
 12. add_course - 添加课程（管理员添加公共课程，普通用户添加私人课程）
    args: {"name": "课程名", "time_slots": "时间，必须是标准格式: X-Y周 星期Z A-B"}
@@ -405,6 +421,14 @@ ACTION: {"action": "list_assignments", "args": {}}
 用户: 计算理论4月17日23:59前交纸质作 1.4a
 回复: 好的，我帮你记下这条作业。
 ACTION: {"action": "add_assignment", "args": {"course": "计算理论", "deadline": "2026-04-17 23:59", "description": "纸质作 1.4a"}}
+
+用户: 把作业 3 和 4 标记完成
+回复: 好的，我帮你一起标记。
+ACTION: {"action": "complete_assignments", "args": {"assignment_ids": [3, 4]}}
+
+用户: 删除作业 3 4 2
+回复: 好的，我帮你一起删除。
+ACTION: {"action": "delete_assignments", "args": {"assignment_ids": [3, 4, 2]}}
 
 用户: 我的早报几点发
 回复:
@@ -453,7 +477,8 @@ ACTION: {"action": "approve_user", "args": {"qq_id": "123456789", "role": "user"
 回复: 我现在还不能直接修改已有作业，你先 /list 看编号，删除旧作业后再把新的截止时间和内容发给我。
 
 重要: args 里的参数名必须严格使用上面列出的名称（如 title、remind_at、time_slots），不要用其他名称。
-重要: complete_assignment.assignment_id 和 delete_assignment.assignment_id 必须使用用户当前 /list 里看到的作业编号。
+重要: complete_assignments.assignment_ids 和 delete_assignments.assignment_ids 必须使用用户当前 /list 里看到的作业编号。
+重要: 涉及多个作业编号时，必须使用数组一次性表达，不要只挑一个编号执行。
 重要: add_assignment 只用于新增作业；如果用户是在问是否支持、怎么用，或是在修改已有作业，不要输出 ACTION。
 重要: 如果新增作业缺课程、截止时间、作业内容中的任一项，先追问，不要输出带空字符串的 ACTION。
 重要: add_assignment.deadline 和 add_custom_reminder.remind_at 必须是 YYYY-MM-DD HH:MM。
@@ -464,6 +489,40 @@ ACTION: {"action": "approve_user", "args": {"qq_id": "123456789", "role": "user"
 
 _RE_ACTION_LINE = re.compile(r"ACTION:\s*(\{.+\})\s*$", re.MULTILINE)
 _RE_THINK_TAGS = re.compile(r"<think>[\s\S]*?</think>")
+_ASSIGNMENT_TIME_HINT_RE = re.compile(
+    r"(今天|明天|后天|大后天|本周[一二三四五六日天]|这周[一二三四五六日天]"
+    r"|下周[一二三四五六日天]|周[一二三四五六日天]"
+    r"|\d{1,2}\s*[月/\.]\s*\d{1,2}"
+    r"|\d{4}\s*-\s*\d{1,2}\s*-\s*\d{1,2}"
+    r"|\d{1,2}\s*[:：]\s*\d{1,2}"
+    r"|截止|之前|ddl|deadline|上午|中午|下午|晚上|今晚)"
+)
+_ASSIGNMENT_CAPABILITY_TOKENS = (
+    "我可以",
+    "可不可以",
+    "能不能",
+    "能否",
+    "怎么",
+    "如何",
+    "支持",
+    "行不行",
+    "可以吗",
+)
+_ASSIGNMENT_ADD_TOKENS = ("添加", "加", "记", "记录", "录入", "创建")
+_ASSIGNMENT_UPDATE_TOKENS = (
+    "修改",
+    "改成",
+    "改到",
+    "改下",
+    "改一下",
+    "调整",
+    "更新",
+    "延期",
+    "延后",
+    "推迟",
+    "提前",
+    "变更",
+)
 
 
 def _strip_think_tags(text: str) -> str:
@@ -489,6 +548,70 @@ def _format_add_assignment_usage() -> str:
         "添加作业需要课程、截止时间和作业内容。"
         "直接发一句就行，比如：计算理论这周四之前交纸质作 1.4a。"
     )
+
+
+def _format_assignment_modify_guidance() -> str:
+    return (
+        "我现在还不能直接修改已有作业。"
+        "先 /list 看编号，删除旧作业后再把新的截止时间和内容发给我。"
+    )
+
+
+def _is_assignment_capability_query(text: str) -> bool:
+    normalized = text.strip()
+    if "作业" not in normalized:
+        return False
+    if not any(token in normalized for token in _ASSIGNMENT_ADD_TOKENS):
+        return False
+    if not any(token in normalized for token in _ASSIGNMENT_CAPABILITY_TOKENS):
+        return False
+    return _ASSIGNMENT_TIME_HINT_RE.search(normalized) is None
+
+
+def _is_assignment_update_intent(text: str) -> bool:
+    normalized = text.strip()
+    if not any(token in normalized for token in ("作业", "截止", "ddl", "deadline")):
+        return False
+    return any(token in normalized for token in _ASSIGNMENT_UPDATE_TOKENS)
+
+
+def _guard_llm_action(user_message: str, action_name: str) -> str | None:
+    normalized = user_message.strip()
+    if action_name != "add_assignment":
+        return None
+    if _is_assignment_capability_query(normalized):
+        return _format_add_assignment_usage()
+    if _is_assignment_update_intent(normalized):
+        return _format_assignment_modify_guidance()
+    return None
+
+
+def _parse_assignment_ids_arg(
+    args: dict,
+) -> tuple[list[int] | None, str | None]:
+    raw_ids = args.get("assignment_ids")
+    if raw_ids is None and "assignment_id" in args:
+        raw_ids = [args["assignment_id"]]
+    if not isinstance(raw_ids, list) or not raw_ids:
+        return None, "请提供至少一个作业编号"
+
+    assignment_ids: list[int] = []
+    seen: set[int] = set()
+    for raw_id in raw_ids:
+        try:
+            assignment_id = int(raw_id)
+        except (TypeError, ValueError):
+            return None, "作业编号格式错误，请使用整数数组"
+        if assignment_id <= 0:
+            return None, "作业编号必须是正整数"
+        if assignment_id in seen:
+            continue
+        seen.add(assignment_id)
+        assignment_ids.append(assignment_id)
+
+    if not assignment_ids:
+        return None, "请提供至少一个作业编号"
+    return assignment_ids, None
 
 
 def _parse_llm_datetime(raw: str, field_label: str, example: str) -> tuple[str | None, str | None]:
@@ -556,6 +679,8 @@ def _build_system_prompt(context: str, use_json_fallback: bool, role: str | None
         "当你输出 add_assignment.deadline 或 add_custom_reminder.remind_at 时，"
         "必须使用 YYYY-MM-DD HH:MM 绝对时间格式；不要输出 明天、周五、这周四之前 这类自然语言。\n"
         "如果你无法把时间唯一换算成标准时间，就先追问，不要输出模糊时间。\n"
+        "涉及作业完成或删除时，优先使用批量动作 complete_assignments / delete_assignments；"
+        "即使只有 1 个编号，也要用 assignment_ids 数组表达。\n"
         "涉及每日早报时间或开关时，不要当成普通提醒，优先使用 get_briefing_settings 或 set_briefing_time；"
         "如果用户只说想修改早报但没给目标时间，可以先追问具体时间。\n"
         "涉及课程操作时，优先使用当前上下文里的精确课程名；"
@@ -718,6 +843,9 @@ async def _try_json_fallback(
             action_name = action_data.get("action", "")
             action_args = action_data.get("args", {})
             logger.info(f"LLM ACTION: {action_name} args={action_args}")
+            guard_message = _guard_llm_action(user_message, action_name)
+            if guard_message is not None:
+                return f"{display_text}\n{guard_message}".strip() if display_text else guard_message
             result = await _execute_tool(action_name, action_args, user_id, role)
             return f"{display_text}\n{result}".strip() if display_text else result
         except (json.JSONDecodeError, KeyError) as exc:
@@ -763,17 +891,48 @@ async def _execute_tool(name: str, args: dict, user_id: str, role: str | None) -
                 f"截止: {deadline_iso}"
             )
 
-        if name == "complete_assignment":
-            aid = int(args["assignment_id"])
-            ok = await complete_assignment_by_display_id(user_id, aid)
-            return f"作业 #{aid} 已完成!" if ok else f"未找到编号 #{aid} 的待完成作业"
+        if name in {"complete_assignments", "complete_assignment"}:
+            assignment_ids, error = _parse_assignment_ids_arg(args)
+            if error:
+                return error
+            assert assignment_ids is not None
+            for assignment_id in assignment_ids:
+                _internal_id, _shown_id, reference_error = await validate_completion_reference(
+                    user_id, assignment_id
+                )
+                if reference_error:
+                    return f"{reference_error}，未执行完成操作"
 
-        if name == "delete_assignment":
-            aid = int(args["assignment_id"])
-            error = await remove_assignment_checked_by_display_id(
-                aid, user_id, _is_admin_or_above(role)
-            )
-            return error if error else f"作业 #{aid} 已删除"
+            for assignment_id in assignment_ids:
+                ok = await complete_assignment_by_display_id(user_id, assignment_id)
+                if not ok:
+                    return f"编号 #{assignment_id} 的作业处理失败，完成操作已中止"
+
+            shown_ids = "、".join(f"#{assignment_id}" for assignment_id in assignment_ids)
+            return f"已完成作业 {shown_ids}"
+
+        if name in {"delete_assignments", "delete_assignment"}:
+            assignment_ids, error = _parse_assignment_ids_arg(args)
+            if error:
+                return error
+            assert assignment_ids is not None
+            is_admin = _is_admin_or_above(role)
+            for assignment_id in assignment_ids:
+                _internal_id, _shown_id, reference_error = await validate_delete_reference(
+                    assignment_id, user_id, is_admin
+                )
+                if reference_error:
+                    return f"{reference_error}，未执行删除"
+
+            for assignment_id in assignment_ids:
+                delete_error = await remove_assignment_checked_by_display_id(
+                    assignment_id, user_id, is_admin
+                )
+                if delete_error:
+                    return f"{delete_error}，删除已中止"
+
+            shown_ids = "、".join(f"#{assignment_id}" for assignment_id in assignment_ids)
+            return f"已删除作业 {shown_ids}"
 
         if name == "list_agenda":
             return await build_agenda_message(user_id)

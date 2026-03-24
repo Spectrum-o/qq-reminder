@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from plugins.homework import llm_handler
 from plugins.homework.assignment_service import add_manual_assignment, list_pending_message
-from plugins.homework.llm_service import _build_system_prompt, _execute_tool
+from plugins.homework.llm_service import (
+    _build_system_prompt,
+    _execute_tool,
+    _guard_llm_action,
+)
 from plugins.homework.database import list_pending_custom_reminders
 from plugins.homework.user_service import subscribe_courses
 
@@ -21,36 +24,43 @@ def _write_public_course(course_file, course_id: str = "sd101", name: str = "计
 
 
 class TestLlmAssignmentActions:
-    async def test_local_assignment_capability_query_returns_guidance(self, env_with_users):
-        result = await llm_handler._try_handle_local_assignment_message(
-            "我可以给计算理论添加作业吗",
-        )
-
-        assert result == (
-            "可以。直接发“课程名 + 截止时间 + 作业内容”就行，"
-            "比如“计算理论这周四之前交纸质作 1.4a”。"
-        )
-
-    async def test_local_assignment_update_intent_blocks_accidental_add(self, env_with_users):
-        result = await llm_handler._try_handle_local_assignment_message(
-            "修改作业时间，计算理论这周三（3.25）之前有纸质作：1.4a, 1.5c",
-        )
-
-        assert result == (
-            "我现在还不会直接修改已有作业，避免误加成一条新作业。"
-            "先 /list 看编号，删掉原作业后再把新的截止时间和内容发给我。"
-        )
-
-    async def test_local_assignment_handler_does_not_block_real_add_request(
+    async def test_assignment_action_guard_returns_guidance_for_capability_query(
         self, env_with_users
     ):
-        result = await llm_handler._try_handle_local_assignment_message(
+        result = _guard_llm_action(
+            "我可以给计算理论添加作业吗",
+            "add_assignment",
+        )
+
+        assert result == (
+            "添加作业需要课程、截止时间和作业内容。"
+            "直接发一句就行，比如：计算理论这周四之前交纸质作 1.4a。"
+        )
+
+    async def test_assignment_action_guard_blocks_accidental_modify_intent(
+        self, env_with_users
+    ):
+        result = _guard_llm_action(
+            "修改作业时间，计算理论这周三（3.25）之前有纸质作：1.4a, 1.5c",
+            "add_assignment",
+        )
+
+        assert result == (
+            "我现在还不能直接修改已有作业。"
+            "先 /list 看编号，删除旧作业后再把新的截止时间和内容发给我。"
+        )
+
+    async def test_assignment_action_guard_does_not_block_real_add_request(
+        self, env_with_users
+    ):
+        result = _guard_llm_action(
             "能帮我记一下计算理论这周四之前的纸质作吗：1.4a, 1.5c",
+            "add_assignment",
         )
 
         assert result is None
 
-    async def test_local_assignment_batch_delete_is_atomic(self, env_with_users):
+    async def test_delete_assignments_is_atomic(self, env_with_users):
         _write_public_course(env_with_users["course_file"])
         await subscribe_courses("user1", ["计算理论"])
 
@@ -72,8 +82,9 @@ class TestLlmAssignmentActions:
         )
         await list_pending_message("user1")
 
-        result = await llm_handler._try_handle_local_assignment_id_action(
-            "删除作业3 2",
+        result = await _execute_tool(
+            "delete_assignments",
+            {"assignment_ids": [3, 2]},
             "user1",
             "user",
         )
@@ -83,7 +94,7 @@ class TestLlmAssignmentActions:
         assert "作业1 [私]" in pending
         assert "作业2 [私]" in pending
 
-    async def test_local_assignment_batch_delete_deletes_all_requested_ids(
+    async def test_delete_assignments_deletes_all_requested_ids(
         self, env_with_users
     ):
         _write_public_course(env_with_users["course_file"])
@@ -100,8 +111,9 @@ class TestLlmAssignmentActions:
             )
         await list_pending_message("user1")
 
-        result = await llm_handler._try_handle_local_assignment_id_action(
-            "把作业 3、2 删掉",
+        result = await _execute_tool(
+            "delete_assignments",
+            {"assignment_ids": [3, 2]},
             "user1",
             "user",
         )
@@ -112,7 +124,7 @@ class TestLlmAssignmentActions:
         assert "作业2" not in pending
         assert "作业3" not in pending
 
-    async def test_local_assignment_batch_complete_marks_all_requested_ids(
+    async def test_complete_assignments_marks_all_requested_ids(
         self, env_with_users
     ):
         _write_public_course(env_with_users["course_file"])
@@ -136,8 +148,9 @@ class TestLlmAssignmentActions:
         )
         await list_pending_message("user1")
 
-        result = await llm_handler._try_handle_local_assignment_id_action(
-            "把第2和第1个作业标记完成",
+        result = await _execute_tool(
+            "complete_assignments",
+            {"assignment_ids": [2, 1]},
             "user1",
             "user",
         )
@@ -220,3 +233,4 @@ class TestLlmAssignmentActions:
 
         assert "必须使用 YYYY-MM-DD HH:MM 绝对时间格式" in prompt
         assert "不要把 明天、这周四之前、下周一上午" in prompt
+        assert "complete_assignments / delete_assignments" in prompt
