@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime
+from unittest.mock import patch
+
 from plugins.homework import llm_handler
 from plugins.homework.assignment_service import list_pending_message
 from plugins.homework.llm_service import _execute_tool
@@ -17,6 +20,12 @@ def _write_public_course(course_file, course_id: str = "sd101", name: str = "计
         + "\n",
         encoding="utf-8",
     )
+
+
+class _FrozenDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2026, 3, 24, 10, 0, tzinfo=tz)
 
 
 class TestLlmAssignmentActions:
@@ -80,3 +89,21 @@ class TestLlmAssignmentActions:
         assert "已添加私人作业 #" in result
         pending = await list_pending_message("user1")
         assert "[计算理论] 纸质作 1.4a, 1.5c [私]" in pending
+
+    async def test_add_assignment_accepts_this_week_deadline_phrase(self, env_with_users):
+        _write_public_course(env_with_users["course_file"])
+        await subscribe_courses("user1", ["计算理论"])
+
+        with patch("plugins.homework.time_parser.datetime", _FrozenDateTime):
+            result = await _execute_tool(
+                "add_assignment",
+                {
+                    "course": "计算理论",
+                    "deadline": "这周四之前",
+                    "description": "纸质作 2.1",
+                },
+                "user1",
+                "user",
+            )
+
+        assert "截止: 2026-03-26 23:59" in result

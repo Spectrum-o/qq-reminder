@@ -20,7 +20,7 @@ _RE_RELATIVE_DAY = re.compile(
 )
 
 _RE_WEEKDAY = re.compile(
-    r"^(下?周([一二三四五六日天]))"
+    r"^((?:这周|本周|下周|周)([一二三四五六日天]))"
     r"(?:[-:]?(\d{1,2}:\d{2}))?$"
 )
 
@@ -28,6 +28,7 @@ _RE_CHINESE_DATE = re.compile(
     r"^(\d{1,2})[月/](\d{1,2})[日号]?"
     r"(?:[-:]?(\d{1,2}:\d{2}))?$"
 )
+_RE_DEADLINE_SUFFIX = re.compile(r"(?:截止前|之前|以前|截止|前)$")
 
 
 def _resolve_time(time_part: str | None) -> str:
@@ -44,7 +45,7 @@ def parse_natural_deadline(text: str) -> str:
     Returns deadline in STORED_DATETIME_FORMAT ('YYYY-MM-DD HH:MM').
     Raises ValueError if no format matches.
     """
-    text = text.strip()
+    text = _RE_DEADLINE_SUFFIX.sub("", text.strip())
 
     # 1. Try strict format (YYYY-MM-DD-HH:MM)
     try:
@@ -74,7 +75,7 @@ def parse_natural_deadline(text: str) -> str:
             datetime.strptime(f"{target_date} {time_str}", STORED_DATETIME_FORMAT)
         )
 
-    # 3. Weekday: 周五, 下周一, 周日
+    # 3. Weekday: 周五, 这周四, 本周日, 下周一
     m = _RE_WEEKDAY.match(text)
     if m:
         prefix = m.group(1)
@@ -83,8 +84,11 @@ def parse_natural_deadline(text: str) -> str:
         current_weekday = today.weekday()
 
         if prefix.startswith("下"):
-            # 下周X: always next week
-            days_ahead = (target_weekday - current_weekday) % 7 + 7
+            # 下周X: the target weekday in the next calendar week
+            days_ahead = (7 - current_weekday) + target_weekday
+        elif prefix.startswith(("这", "本")):
+            # 这周X / 本周X: roll within the current week if possible
+            days_ahead = (target_weekday - current_weekday) % 7
         else:
             # 周X: this week if not passed, else next week
             days_ahead = (target_weekday - current_weekday) % 7
