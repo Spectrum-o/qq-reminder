@@ -4,6 +4,8 @@ __pycache__/
 data/
 *.db
 .env
+deploy/napcat/.env
+deploy/napcat/napcat-data/
 config.json
 course.txt
 assignments.json

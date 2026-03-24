@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from .course_parser import build_course_key_selector_map, get_all_courses
 from .course_reminder import get_today_schedule_for_user
 from .database import list_pending, list_pending_custom_reminders
 from .models import STORED_DATETIME_FORMAT
@@ -23,6 +24,7 @@ def _relative_day_label(target: datetime, now: datetime) -> str:
 async def build_agenda_message(user_id: str) -> str:
     now = datetime.now()
     lines = ["事项总览:"]
+    course_labels = build_course_key_selector_map(get_all_courses(user_id=user_id))
 
     schedule = await get_today_schedule_for_user(user_id)
     lines.append("")
@@ -35,7 +37,7 @@ async def build_agenda_message(user_id: str) -> str:
                 else ""
             )
             lines.append(
-                f"  [课程] 第{course['period']}节 {course['time']}  {course['name']}{location}"
+                f"  [课程] 第{course['period']}节 {course['time']}  {course.get('label', course['name'])}{location}"
             )
     else:
         lines.append("今日无课程")
@@ -54,10 +56,15 @@ async def build_agenda_message(user_id: str) -> str:
             sort_dt = datetime.max
 
         visibility_label = " [私]" if row.get("visibility") == "private" else ""
+        course_label = (
+            course_labels.get(row.get("course_key", ""), row["course"])
+            if row.get("course_key") and not str(row.get("course_key")).startswith("legacy:")
+            else row["course"]
+        )
         entries.append(
             (
                 sort_dt,
-                f"  [作业] #{row['id']} [{row['course']}] {row['description']}{visibility_label}"
+                f"  [作业] #{row['id']} [{course_label}] {row['description']}{visibility_label}"
                 f" — {day_label} {time_label}".rstrip(),
             )
         )

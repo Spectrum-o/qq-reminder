@@ -2,6 +2,7 @@ import re
 from datetime import datetime, timedelta
 
 from nonebot import on_command, on_message
+from nonebot.log import logger
 from nonebot.params import CommandArg
 from nonebot.rule import Rule
 from nonebot.adapters.onebot.v11 import Bot, PrivateMessageEvent, Message
@@ -20,6 +21,7 @@ from .agenda_service import build_agenda_message
 from .course_parser import (
     parse_courses,
     get_all_courses,
+    get_course_selector,
     add_custom_course,
     delete_custom_course,
     is_valid_time_slots,
@@ -29,6 +31,8 @@ from .daily_briefing import build_daily_briefing
 from .database import (
     add_reminder,
     delete_assignments_by_course,
+    delete_course_reminders_for_user_course_keys,
+    delete_homework_reminders_for_user_course_keys,
     delete_homework_reminders_for_user_courses,
     delete_reminder,
     delete_reminders_by_course,
@@ -45,8 +49,14 @@ from .recurring_service import format_recurring_rules
 from .time_parser import parse_natural_deadline
 from .user_service import (
     approve_user,
+    get_user_subscription_keys,
+    get_user_subscription_name_map,
+    get_user_subscription_names,
     get_user_role,
+    get_user_subscription_selector_map,
     get_user_subscriptions,
+    get_visible_course_selectors,
+    resolve_visible_course,
     is_admin_or_above,
     is_approved,
     is_root,
@@ -94,6 +104,117 @@ async def _refresh_today_course_reminders() -> None:
     from .course_reminder import generate_course_reminders_for_date
 
     await generate_course_reminders_for_date()
+
+
+_COURSE_SEPARATOR_RE = re.compile(r"[;\n]+")
+_TIME_SLOT_START_RE = re.compile(
+    r"\d[\d,\-]*周\s+星期[一二三四五六日]\s+\d+-\d+"
+)
+
+
+def _normalize_inline_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _split_course_names(text: str, candidates: list[str]) -> list[str]:
+    normalized = _normalize_inline_whitespace(text)
+    if not normalized:
+        return []
+
+    explicit_parts = [
+        _normalize_inline_whitespace(part)
+        for part in _COURSE_SEPARATOR_RE.split(normalized.replace("；", ";"))
+        if part.strip()
+    ]
+    if len(explicit_parts) > 1:
+        return explicit_parts
+
+    normalized_candidates = {
+        _normalize_inline_whitespace(name)
+        for name in candidates
+        if _normalize_inline_whitespace(name)
+    }
+    if normalized in normalized_candidates:
+        return [normalized]
+
+    tokens = normalized.split(" ")
+    if len(tokens) <= 1:
+        return [normalized]
+
+    options_by_first_token: dict[str, list[tuple[str, ...]]] = {}
+    for name in normalized_candidates:
+        token_tuple = tuple(name.split(" "))
+        options_by_first_token.setdefault(token_tuple[0], []).append(token_tuple)
+    for options in options_by_first_token.values():
+        options.sort(key=len, reverse=True)
+
+    memo: dict[int, tuple[str, ...] | None] = {}
+
+    def _parse_from(index: int) -> tuple[str, ...] | None:
+        if index == len(tokens):
+            return ()
+        if index in memo:
+            return memo[index]
+
+        for candidate_tokens in options_by_first_token.get(tokens[index], []):
+            end = index + len(candidate_tokens)
+            if tuple(tokens[index:end]) != candidate_tokens:
+                continue
+            rest = _parse_from(end)
+            if rest is not None:
+                memo[index] = (" ".join(candidate_tokens),) + rest
+                return memo[index]
+
+        memo[index] = None
+        return None
+
+    parsed = _parse_from(0)
+    if parsed is not None:
+        return list(parsed)
+
+    return normalized.split(" ")
+
+
+def _parse_addcourse_args(text: str) -> tuple[str, str] | None:
+    normalized = text.replace("；", ";").strip()
+    match = _TIME_SLOT_START_RE.search(normalized)
+    if not match:
+        return None
+
+    name = _normalize_inline_whitespace(normalized[:match.start()])
+    time_slots = normalized[match.start():].strip()
+    if not name or not time_slots:
+        return None
+    return name, time_slots
+
+
+def _parse_add_args(text: str, candidates: list[str]) -> tuple[str, str, str] | None:
+    normalized = _normalize_inline_whitespace(text)
+    if not normalized:
+        return None
+
+    normalized_candidates = sorted(
+        {
+            _normalize_inline_whitespace(name)
+            for name in candidates
+            if _normalize_inline_whitespace(name)
+        },
+        key=len,
+        reverse=True,
+    )
+    for course_name in normalized_candidates:
+        prefix = f"{course_name} "
+        if not normalized.startswith(prefix):
+            continue
+        remainder = normalized[len(prefix):].strip()
+        parts = remainder.split(maxsplit=1)
+        if len(parts) == 2:
+            return course_name, parts[0], parts[1]
+
+    parts = normalized.split(maxsplit=2)
+    if len(parts) != 3:
+        return None
+    return parts[0], parts[1], parts[2]
 
 
 _PENDING_MSG = (
@@ -161,7 +282,10 @@ async def handle_quick_delete(bot: Bot, event: PrivateMessageEvent):
     if not user_id:
         await quick_delete.finish(_PENDING_MSG)
     text = event.get_plaintext().strip()
-    aid = int(re.search(r"\d+", text).group())
+    m = re.search(r"\d+", text)
+    if not m:
+        await quick_delete.finish("格式错误，请输入 x<编号>")
+    aid = int(m.group())
     is_admin = await is_admin_or_above(user_id)
     error = await remove_assignment_checked(aid, user_id, is_admin)
     if error:
@@ -191,10 +315,12 @@ async def handle_add(bot: Bot, event: PrivateMessageEvent, args: Message = Comma
     user_id = await _check_user(event)
     if not user_id:
         await add_cmd.finish(_PENDING_MSG)
-    parts = args.extract_plain_text().strip().split(maxsplit=2)
-    if len(parts) < 3:
+    visible_courses = get_visible_course_selectors(user_id)
+    parsed = _parse_add_args(args.extract_plain_text().strip(), visible_courses)
+    if parsed is None:
         await add_cmd.finish(
             "格式: /add <课程名> <截止时间> <描述>\n"
+            "同名公共课请使用 课程名#课程编号\n"
             "时间支持:\n"
             "  明天 / 后天 / 周五 / 下周一\n"
             "  4月15日 / 4/15\n"
@@ -204,7 +330,7 @@ async def handle_add(bot: Bot, event: PrivateMessageEvent, args: Message = Comma
             "例: /add 操作系统 下周五 Lab3实验报告\n"
             "\n管理员=公共作业, 普通用户=私人作业"
         )
-    course, deadline_str, desc = parts
+    course_selector, deadline_str, desc = parsed
     try:
         deadline_iso = parse_command_deadline(deadline_str)
     except ValueError:
@@ -215,11 +341,27 @@ async def handle_add(bot: Bot, event: PrivateMessageEvent, args: Message = Comma
             "完整格式: 2026-04-15-23:59"
         )
 
+    course = resolve_visible_course(user_id, course_selector)
+    if course is None:
+        await add_cmd.finish(
+            "未找到匹配课程，请先发送 /courses 查看可用课程。\n"
+            "如存在同名公共课，请使用 课程名#课程编号。"
+        )
+
     is_admin = await is_admin_or_above(user_id)
     visibility = "public" if is_admin else "private"
-    aid = await add_manual_assignment(course, desc, deadline_iso, visibility=visibility, owner_id=user_id)
+    aid = await add_manual_assignment(
+        course.name,
+        desc,
+        deadline_iso,
+        visibility=visibility,
+        owner_id=user_id,
+        course_key=course.course_key,
+    )
     label = "公共" if visibility == "public" else "私人"
-    await add_cmd.finish(f"已添加{label}作业 #{aid}: [{course}] {desc}\n截止: {deadline_iso}")
+    await add_cmd.finish(
+        f"已添加{label}作业 #{aid}: [{course_selector}] {desc}\n截止: {deadline_iso}"
+    )
 
 
 # ── /list ─────────────────────────────────────────
@@ -543,8 +685,8 @@ async def handle_approve(bot: Bot, event: PrivateMessageEvent, args: Message = C
                     "发送 /subscribe 查看可选课程并按需订阅"
                 ),
             )
-        except Exception:
-            pass  # Best effort, don't fail the approve command
+        except Exception as e:
+            logger.warning(f"Failed to notify approved user {target_qq}: {e}")
         await approve_cmd.finish(f"已通过 {target_qq} 的注册 (角色: {role_label})")
     else:
         await approve_cmd.finish(f"审核失败: 用户 {target_qq} 不存在或已审核")
@@ -582,14 +724,17 @@ async def handle_subscribe(bot: Bot, event: PrivateMessageEvent, args: Message =
     if not text:
         # Show available courses and current subscriptions
         all_courses = get_all_courses(user_id)
-        current_subs = set(await get_user_subscriptions(user_id))
+        current_sub_keys = set(await get_user_subscription_keys(user_id))
         if not all_courses:
             await subscribe_cmd.finish("未找到课程数据")
         lines = ["可选课程 (已订阅标 *):"]
         for c in all_courses:
-            mark = " *" if c.name in current_subs else ""
-            lines.append(f"  {c.name}{mark}")
+            selector = get_course_selector(c, all_courses)
+            mark = " *" if c.course_key in current_sub_keys else ""
+            lines.append(f"  {selector}{mark}")
         lines.append("\n使用: /subscribe <课程名1> <课程名2> ...")
+        lines.append("同名公共课请按列表中的 课程名#课程编号 输入")
+        lines.append("课程名含空格时，多个课程建议用分号分隔")
         lines.append("使用: /subscribe all 订阅全部")
         await subscribe_cmd.finish("\n".join(lines))
 
@@ -598,7 +743,8 @@ async def handle_subscribe(bot: Bot, event: PrivateMessageEvent, args: Message =
         await sync_homework_reminders_for_user(user_id)
         await subscribe_cmd.finish(f"已订阅全部课程 ({len(added)} 门新订阅)")
 
-    course_names = text.split()
+    candidates = get_visible_course_selectors(user_id)
+    course_names = _split_course_names(text, candidates)
     added = await subscribe_courses(user_id, course_names)
     if added:
         await sync_homework_reminders_for_user(user_id)
@@ -619,12 +765,34 @@ async def handle_unsubscribe(bot: Bot, event: PrivateMessageEvent, args: Message
 
     text = args.extract_plain_text().strip()
     if not text:
-        await unsubscribe_cmd.finish("格式: /unsubscribe <课程名1> <课程名2> ...")
+        await unsubscribe_cmd.finish(
+            "格式: /unsubscribe <课程名1> <课程名2> ...\n"
+            "课程名含空格时，多个课程建议用分号分隔"
+        )
 
-    course_names = text.split()
+    selector_to_name = await get_user_subscription_name_map(user_id)
+    selector_to_key = await get_user_subscription_selector_map(user_id)
+    current_subscriptions = await get_user_subscriptions(user_id)
+    course_names = _split_course_names(text, current_subscriptions)
     removed = await unsubscribe_courses(user_id, course_names)
     if removed:
-        await delete_homework_reminders_for_user_courses(user_id, removed)
+        cleanup_keys = [
+            selector_to_key[selector]
+            for selector in removed
+            if selector in selector_to_key
+        ]
+        remaining_names = set(await get_user_subscription_names(user_id))
+        cleanup_names = sorted(
+            {
+                selector_to_name[selector]
+                for selector in removed
+                if selector in selector_to_name
+                and selector_to_name[selector] not in remaining_names
+            }
+        )
+        await delete_homework_reminders_for_user_course_keys(user_id, cleanup_keys)
+        await delete_homework_reminders_for_user_courses(user_id, cleanup_names)
+        await delete_course_reminders_for_user_course_keys(user_id, cleanup_keys)
         await _refresh_today_course_reminders()
         await unsubscribe_cmd.finish(f"已退订: {', '.join(removed)}")
     else:
@@ -661,8 +829,8 @@ async def handle_addcourse(bot: Bot, event: PrivateMessageEvent, args: Message =
         await addcourse_cmd.finish(_PENDING_MSG)
 
     text = args.extract_plain_text().strip()
-    parts = text.split(maxsplit=1)
-    if len(parts) < 2:
+    parsed = _parse_addcourse_args(text)
+    if parsed is None:
         await addcourse_cmd.finish(
             "格式: /addcourse <课程名> <时间>\n"
             "时间格式: X-Y周 星期Z A-B\n"
@@ -673,7 +841,7 @@ async def handle_addcourse(bot: Bot, event: PrivateMessageEvent, args: Message =
             "公共课程名全局唯一；私人课程名仅对自己唯一，但不能与公共课程重名"
         )
 
-    name, time_slots = parts
+    name, time_slots = parsed
     time_slots = time_slots.replace("；", ";").strip()
     if not is_valid_time_slots(time_slots):
         await addcourse_cmd.finish(
@@ -760,24 +928,36 @@ async def handle_notify(bot: Bot, event: PrivateMessageEvent, args: Message = Co
     text = args.extract_plain_text().strip()
     if not text:
         # Show current notify status
-        enabled = await get_notify_courses(user_id)
+        enabled = set(await get_notify_courses(user_id))
         subs = await get_user_subscriptions(user_id)
         if not subs:
             await notify_cmd.finish("你还没有订阅任何课程")
+        selector_map = await get_user_subscription_selector_map(user_id)
         lines = ["课程上课提醒状态 (开启标 *):"]
         for name in sorted(subs):
-            mark = " *" if name in enabled else ""
+            mark = " *" if selector_map.get(name) in enabled else ""
             lines.append(f"  {name}{mark}")
         lines.append("\n使用: /notify <课程名> 开启/关闭")
+        lines.append("同名公共课请使用 课程名#课程编号")
         lines.append("开启后每天早上7:30和课前提醒 (时长见 config.json advance_minutes)")
         await notify_cmd.finish("\n".join(lines))
 
-    result = await toggle_class_notify(user_id, text)
-    if result is None:
+    current_subs = await get_user_subscriptions(user_id)
+    matched = _split_course_names(text, current_subs)
+    if len(matched) != 1 or matched[0] not in current_subs:
         await notify_cmd.finish(f"你未订阅课程: {text}\n请先 /subscribe {text}")
+    selector_to_key = await get_user_subscription_selector_map(user_id)
+    selector = matched[0]
+    result = await toggle_class_notify(user_id, selector_to_key[selector])
+    if result is None:
+        await notify_cmd.finish(f"你未订阅课程: {selector}\n请先 /subscribe {selector}")
+    if not result:
+        await delete_course_reminders_for_user_course_keys(
+            user_id, [selector_to_key[selector]]
+        )
     await _refresh_today_course_reminders()
     status = "开启" if result else "关闭"
-    await notify_cmd.finish(f"已{status} {text} 的上课提醒")
+    await notify_cmd.finish(f"已{status} {selector} 的上课提醒")
 
 
 # ── /help ─────────────────────────────────────────

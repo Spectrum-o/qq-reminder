@@ -1,5 +1,7 @@
+import hashlib
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass
 
 from nonebot.log import logger
@@ -21,8 +23,75 @@ class Course:
     teacher: str
     time_slots: str
     location: str
+    course_key: str = ""
     visibility: str = "public"
     owner_id: str = ""
+
+
+def _build_public_course_key(
+    code: str,
+    name: str,
+    teacher: str,
+    time_slots: str,
+    location: str,
+) -> str:
+    if code:
+        return f"public:{code}"
+
+    payload = "\x1f".join([name, teacher, time_slots, location])
+    digest = hashlib.md5(payload.encode("utf-8")).hexdigest()[:12]
+    return f"public_sig:{digest}"
+
+
+def _build_custom_course_key(entry: dict) -> str:
+    visibility = entry.get("visibility", "public")
+    owner_id = entry.get("owner_id", "")
+    course_id = entry.get("id", 0)
+    if visibility == "private":
+        return f"private:{owner_id}:{course_id}"
+    return f"public_custom:{course_id}"
+
+
+def _get_duplicate_public_names(courses: list[Course]) -> set[str]:
+    counts = Counter(course.name for course in courses if course.visibility == "public")
+    return {name for name, count in counts.items() if count > 1}
+
+
+def get_course_selector(
+    course: Course,
+    courses: list[Course] | None = None,
+    duplicate_public_names: set[str] | None = None,
+) -> str:
+    if duplicate_public_names is None:
+        duplicate_public_names = _get_duplicate_public_names(courses or [course])
+
+    if course.visibility == "public" and course.name in duplicate_public_names:
+        suffix = course.code or course.course_key.rsplit(":", 1)[-1]
+        return f"{course.name}#{suffix}"
+    return course.name
+
+
+def build_course_selector_map(courses: list[Course]) -> dict[str, Course]:
+    duplicate_public_names = _get_duplicate_public_names(courses)
+    selector_map: dict[str, Course] = {}
+
+    for course in courses:
+        selector = get_course_selector(
+            course, duplicate_public_names=duplicate_public_names
+        )
+        if selector in selector_map:
+            selector = f"{course.name}#{course.course_key.rsplit(':', 1)[-1]}"
+        selector_map[selector] = course
+
+    return selector_map
+
+
+def build_course_key_selector_map(courses: list[Course]) -> dict[str, str]:
+    selector_map = build_course_selector_map(courses)
+    return {
+        course.course_key: selector
+        for selector, course in selector_map.items()
+    }
 
 
 def parse_courses() -> list[Course]:
@@ -99,6 +168,13 @@ def parse_courses() -> list[Course]:
             teacher=teacher,
             time_slots="; ".join(time_parts) if time_parts else "未安排",
             location="; ".join(location_parts) if location_parts else "未安排",
+            course_key=_build_public_course_key(
+                code,
+                name,
+                teacher,
+                "; ".join(time_parts) if time_parts else "未安排",
+                "; ".join(location_parts) if location_parts else "未安排",
+            ),
         ))
 
     return courses
@@ -129,6 +205,19 @@ def _next_custom_id(courses: list[dict]) -> int:
     if not courses:
         return 1
     return max(c.get("id", 0) for c in courses) + 1
+
+
+def _parse_weeks(week_str: str) -> list[int]:
+    """Parse week specifiers like '1-16', '5,7,9,11', '2-13,15-18' into a list of week numbers."""
+    weeks = []
+    for part in week_str.split(","):
+        part = part.strip()
+        m = re.match(r"(\d+)-(\d+)", part)
+        if m:
+            weeks.extend(range(int(m.group(1)), int(m.group(2)) + 1))
+        elif part.isdigit():
+            weeks.append(int(part))
+    return weeks
 
 
 def is_valid_time_slots(time_slots: str) -> bool:
@@ -261,6 +350,7 @@ def get_all_courses(
             teacher=c.get("teacher", ""),
             time_slots=c.get("time_slots", "未安排"),
             location=c.get("location", "") or "未安排",
+            course_key=_build_custom_course_key(c),
             visibility=c.get("visibility", "public"),
             owner_id=c.get("owner_id", ""),
         ))

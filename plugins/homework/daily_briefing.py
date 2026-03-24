@@ -9,6 +9,7 @@ require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler  # noqa: E402
 
 from .config import OWNER_QQ  # noqa: E402
+from .course_parser import build_course_key_selector_map, get_all_courses  # noqa: E402
 from .course_reminder import get_today_schedule_for_user  # noqa: E402
 from .database import get_users_for_briefing_time, list_pending, list_pending_custom_reminders  # noqa: E402
 from .models import STORED_DATETIME_FORMAT  # noqa: E402
@@ -30,6 +31,7 @@ async def build_daily_briefing(user_id: str) -> str:
     now = datetime.now()
     today_str = now.strftime("%m月%d日")
     weekday_str = WEEKDAY_NAMES[now.weekday()]
+    course_labels = build_course_key_selector_map(get_all_courses(user_id=user_id))
 
     lines = [f"早上好! 今天是 {today_str} {weekday_str}"]
 
@@ -40,7 +42,7 @@ async def build_daily_briefing(user_id: str) -> str:
         lines.append("今日课程:")
         for c in schedule:
             location = f" @ {c['location']}" if c.get("location", "未安排") != "未安排" else ""
-            lines.append(f"  第{c['period']}节 {c['time']}  {c['name']}{location}")
+            lines.append(f"  第{c['period']}节 {c['time']}  {c.get('label', c['name'])}{location}")
     else:
         lines.append("今日无课程")
 
@@ -60,8 +62,13 @@ async def build_daily_briefing(user_id: str) -> str:
             else:
                 day_label = _relative_day_label(delta_days)
             time_str = deadline_dt.strftime("%H:%M")
+            course_label = (
+                course_labels.get(row.get("course_key", ""), row["course"])
+                if row.get("course_key") and not str(row.get("course_key")).startswith("legacy:")
+                else row["course"]
+            )
             upcoming.append(
-                f"  #{row['id']} [{row['course']}] {row['description']}"
+                f"  #{row['id']} [{course_label}] {row['description']}"
                 f" — {day_label} {time_str}"
             )
 

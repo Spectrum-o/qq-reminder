@@ -21,11 +21,11 @@ PUBLIC_BOT_GUIDE = """
 - /agenda 查看统一事项总览
 - /list /add /done /delete /stats /rules 管理作业型事项
 - /remind /reminders /cancel 管理个人提醒
-- /today /courses /briefing /notify 查看课程和提醒
+- /today /courses /briefing /briefing_time /notify 查看课程和提醒
 - /approve 是管理员命令；/users 仅 root 可用
 
 自然语言:
-- 审批通过后，可以直接用自然语言查看事项、添加作业型事项、设置提醒、查看课程。
+- 审批通过后，可以直接用自然语言查看事项、添加作业型事项、设置提醒、查看课程，也可以查看或调整每日早报时间。
 - 管理员还可以通过自然语言管理公共作业型事项和公共课程。
 - 管理员还可以通过自然语言查看待审核用户并审批普通用户；root 还可以通过自然语言查看所有用户及其角色，并授予管理员。
 - 未审批用户可以询问公开功能和使用方式，但不能执行个人操作。

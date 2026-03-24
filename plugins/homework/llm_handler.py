@@ -1,11 +1,15 @@
+import re
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime
 from time import monotonic
 
-from nonebot import on_message
+from nonebot import on_message, require
 from nonebot.log import logger
 from nonebot.adapters.onebot.v11 import Bot, PrivateMessageEvent
+
+require("nonebot_plugin_apscheduler")
+from nonebot_plugin_apscheduler import scheduler  # noqa: E402
 
 from .config import (
     LLM_API_BASE,
@@ -34,6 +38,12 @@ llm_fallback = on_message(priority=99, block=False)
 _llm_request_windows: dict[str, deque[float]] = defaultdict(deque)
 _llm_daily_counts: dict[str, tuple[str, int]] = {}
 _llm_global_window: deque[float] = deque()
+_pending_briefing_followups: dict[str, float] = {}
+
+_BRIEFING_FOLLOWUP_TTL_SECONDS = 300
+_BRIEFING_TIME_CANDIDATE_RE = re.compile(
+    r"(\d{1,2}\s*[:：]\s*\d{1,2}|\d{1,2}\s*(?:点|时)(?:半|\d{1,2}分?)?)"
+)
 
 
 @dataclass(frozen=True)
@@ -134,6 +144,104 @@ def _allow_llm_request(user_id: str, policy: _RateLimitPolicy) -> tuple[bool, st
     return True, ""
 
 
+def _prune_pending_briefing_followups(now: float | None = None) -> None:
+    current = now if now is not None else monotonic()
+    stale_users = [
+        user_id
+        for user_id, expires_at in _pending_briefing_followups.items()
+        if expires_at <= current
+    ]
+    for user_id in stale_users:
+        del _pending_briefing_followups[user_id]
+
+
+def _extract_briefing_value(text: str) -> str | None:
+    normalized = text.strip()
+    lowered = normalized.lower()
+    if not normalized:
+        return None
+
+    if lowered in {"on", "off"}:
+        return lowered
+
+    if any(token in normalized for token in ("关闭", "关掉", "关了", "停掉", "停用")):
+        return "off"
+    if any(token in normalized for token in ("开启", "打开", "恢复")):
+        return "on"
+
+    match = _BRIEFING_TIME_CANDIDATE_RE.search(normalized)
+    if match:
+        candidate = match.group(1).replace(" ", "")
+        if llm_service._parse_briefing_value(candidate) is not None:
+            return candidate
+
+    if re.fullmatch(r"\d{1,2}", normalized):
+        if llm_service._parse_briefing_value(normalized) is not None:
+            return normalized
+
+    return None
+
+
+def _is_briefing_update_intent(text: str) -> bool:
+    normalized = text.strip()
+    if "早报" not in normalized:
+        return False
+
+    return any(
+        token in normalized
+        for token in (
+            "修改",
+            "改成",
+            "改到",
+            "改下",
+            "改一下",
+            "改",
+            "调整",
+            "设置",
+            "调到",
+            "调成",
+            "关掉",
+            "关闭",
+            "开启",
+            "打开",
+            "恢复",
+        )
+    )
+
+
+async def _try_handle_local_briefing_message(
+    text: str,
+    user_id: str,
+    role: str | None,
+) -> str | None:
+    _prune_pending_briefing_followups()
+
+    value = _extract_briefing_value(text)
+    if user_id in _pending_briefing_followups and value is not None:
+        _pending_briefing_followups.pop(user_id, None)
+        return await llm_service._execute_tool(
+            "set_briefing_time",
+            {"value": value},
+            user_id,
+            role,
+        )
+
+    if not _is_briefing_update_intent(text):
+        return None
+
+    if value is not None:
+        _pending_briefing_followups.pop(user_id, None)
+        return await llm_service._execute_tool(
+            "set_briefing_time",
+            {"value": value},
+            user_id,
+            role,
+        )
+
+    _pending_briefing_followups[user_id] = monotonic() + _BRIEFING_FOLLOWUP_TTL_SECONDS
+    return "你想把每日早报改到几点？直接回复时间就行，比如 7:30。"
+
+
 @llm_fallback.handle()
 async def handle_llm_fallback(bot: Bot, event: PrivateMessageEvent):
     text = event.get_plaintext().strip()
@@ -176,6 +284,10 @@ async def handle_llm_fallback(bot: Bot, event: PrivateMessageEvent):
     if not LLM_API_BASE:
         return
 
+    local_briefing_reply = await _try_handle_local_briefing_message(text, user_id, role)
+    if local_briefing_reply:
+        await llm_fallback.finish(local_briefing_reply)
+
     allowed, deny_message = _allow_llm_request(user_id, _USER_POLICY)
     if not allowed:
         logger.warning("LLM user rate limit hit for user %s", user_id)
@@ -189,3 +301,41 @@ async def handle_llm_fallback(bot: Bot, event: PrivateMessageEvent):
     )
     if reply:
         await llm_fallback.finish(reply)
+
+
+@scheduler.scheduled_job("cron", hour=3, minute=15, id="llm_rate_limit_cleanup")
+async def cleanup_rate_limit_dicts():
+    """Remove stale entries from LLM rate-limiting dicts daily."""
+    today = datetime.now().date().isoformat()
+    _prune_pending_briefing_followups()
+
+    # Clean up daily counts: remove entries from previous days
+    stale_keys = [
+        key for key, (day, _count) in _llm_daily_counts.items() if day != today
+    ]
+    for key in stale_keys:
+        del _llm_daily_counts[key]
+
+    # Clean up request windows: remove entries with no recent requests
+    now = monotonic()
+    max_window = max(
+        LLM_PUBLIC_RATE_LIMIT_WINDOW_SECONDS,
+        LLM_USER_RATE_LIMIT_WINDOW_SECONDS,
+        LLM_GLOBAL_RATE_LIMIT_WINDOW_SECONDS,
+    )
+    stale_window_keys = []
+    for key, window in _llm_request_windows.items():
+        # Prune expired entries
+        cutoff = now - max_window
+        while window and window[0] <= cutoff:
+            window.popleft()
+        if not window:
+            stale_window_keys.append(key)
+    for key in stale_window_keys:
+        del _llm_request_windows[key]
+
+    if stale_keys or stale_window_keys:
+        logger.debug(
+            f"LLM rate limit cleanup: removed {len(stale_keys)} daily counts, "
+            f"{len(stale_window_keys)} empty windows"
+        )

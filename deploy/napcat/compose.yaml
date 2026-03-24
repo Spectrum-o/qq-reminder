@@ -4,9 +4,9 @@ services:
     container_name: napcat
     restart: always
     environment:
-      ACCOUNT: "${NAPCAT_ACCOUNT}"
-      NAPCAT_UID: "${NAPCAT_UID}"
-      NAPCAT_GID: "${NAPCAT_GID}"
+      ACCOUNT: "3763906153 "
+      NAPCAT_UID: "1000"
+      NAPCAT_GID: "1000"
       WSR_ENABLE: "true"
     ports:
       - "6099:6099"

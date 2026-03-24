@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from .course_parser import get_all_courses
+from .course_parser import get_all_courses, get_course_selector
 from .course_reminder import get_today_schedule, get_today_schedule_for_user
 
 
@@ -18,7 +18,7 @@ def format_today_schedule() -> str:
             else ""
         )
         lines.append(
-            f"  第{course['period']}节 {course['time']}  {course['name']}{location}"
+            f"  第{course['period']}节 {course['time']}  {course.get('label', course['name'])}{location}"
         )
         if course.get("teacher"):
             lines.append(f"    教师: {course['teacher']}")
@@ -39,7 +39,7 @@ async def format_today_schedule_for_user(user_id: str) -> str:
             else ""
         )
         lines.append(
-            f"  第{course['period']}节 {course['time']}  {course['name']}{location}"
+            f"  第{course['period']}节 {course['time']}  {course.get('label', course['name'])}{location}"
         )
         if course.get("teacher"):
             lines.append(f"    教师: {course['teacher']}")
@@ -53,6 +53,7 @@ def format_course_catalog(user_id: str | None = None) -> str:
         return "未找到课程数据"
 
     lines = ["本学期课程:"]
+    duplicate_context = courses
     for course in courses:
         label_parts = []
         if course.credits:
@@ -60,7 +61,7 @@ def format_course_catalog(user_id: str | None = None) -> str:
         if course.category:
             label_parts.append(course.category)
         label = f" ({', '.join(label_parts)})" if label_parts else ""
-        lines.append(f"  {course.name}{label}")
+        lines.append(f"  {get_course_selector(course, duplicate_context)}{label}")
         if course.teacher:
             lines.append(f"    教师: {course.teacher}")
         lines.append(f"    时间: {course.time_slots}")

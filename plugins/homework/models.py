@@ -25,6 +25,7 @@ class AssignmentDraft:
     course: str
     description: str
     deadline: str
+    course_key: str = ""
     source_type: str = SOURCE_MANUAL
     source_key: str | None = None
     visibility: str = "public"
@@ -55,21 +56,26 @@ class RecurringAssignmentRule:
     description_template: str
     start_date: date
     due_time: time
+    course_key: str = ""
     interval_days: int = 7
     generate_days_ahead: int = 14
     end_date: date | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "RecurringAssignmentRule":
+        from .course_parser import get_all_courses, get_course_selector
+
         rule_id = str(raw.get("id", "")).strip()
         course = str(raw.get("course", "")).strip()
+        course_key = str(raw.get("course_key", "")).strip()
+        course_selector = str(raw.get("course_selector", "")).strip()
         description_template = str(raw.get("description_template", "")).strip()
         start_date_text = str(raw.get("start_date", "")).strip()
         due_time_text = str(raw.get("time", "")).strip()
 
         if not rule_id:
             raise ValueError("missing id")
-        if not course:
+        if not (course or course_key or course_selector):
             raise ValueError(f"{rule_id}: missing course")
         if not description_template:
             raise ValueError(f"{rule_id}: missing description_template")
@@ -120,9 +126,45 @@ class RecurringAssignmentRule:
         except ValueError as exc:
             raise ValueError(f"{rule_id}: invalid description_template") from exc
 
+        public_courses = get_all_courses()
+        if course_key or course_selector:
+            selector_lookup = {
+                get_course_selector(course_entry, public_courses): course_entry
+                for course_entry in public_courses
+            }
+            if course_key:
+                course_by_key = {
+                    course_entry.course_key: course_entry for course_entry in public_courses
+                }
+                matched_course = course_by_key.get(course_key)
+                if matched_course is None:
+                    raise ValueError(f"{rule_id}: unknown course_key {course_key}")
+                course = matched_course.name
+            else:
+                matched_course = selector_lookup.get(course_selector)
+                if matched_course is None:
+                    raise ValueError(
+                        f"{rule_id}: unknown course_selector {course_selector}"
+                    )
+                course = matched_course.name
+                course_key = matched_course.course_key
+        else:
+            matched_courses = [
+                course_entry
+                for course_entry in public_courses
+                if course_entry.name == course
+            ]
+            if len(matched_courses) == 1:
+                course_key = matched_courses[0].course_key
+            elif len(matched_courses) > 1:
+                raise ValueError(
+                    f"{rule_id}: ambiguous course {course}, use course_selector or course_key"
+                )
+
         return cls(
             rule_id=rule_id,
             course=course,
+            course_key=course_key,
             description_template=description_template,
             start_date=start_date,
             due_time=due_time,
@@ -157,6 +199,7 @@ class RecurringAssignmentRule:
                 drafts.append(
                     AssignmentDraft(
                         course=self.course,
+                        course_key=self.course_key,
                         description=description,
                         deadline=deadline_text,
                         source_type=SOURCE_RECURRING,

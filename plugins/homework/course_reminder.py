@@ -8,8 +8,14 @@ from nonebot.log import logger
 require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler  # noqa: E402
 
-from .course_parser import parse_courses, get_all_courses, Course  # noqa: E402
-from .database import add_reminder, delete_future_reminders_by_date, get_class_notify_subscribers, get_subscriptions  # noqa: E402
+from .course_parser import get_all_courses, get_course_selector, Course  # noqa: E402
+from .database import (
+    delete_reminders_by_ref,
+    get_class_notify_subscribers,
+    get_subscriptions,
+    list_unsent_reminders_by_date,
+    sync_reminders,
+)  # noqa: E402
 from .models import ReminderDraft  # noqa: E402
 from .paths import COURSE_REMINDER_CONFIG_PATH  # noqa: E402
 
@@ -82,6 +88,8 @@ def _get_today_courses(
     courses: list[Course],
     config: dict,
     target_date: date,
+    *,
+    label_courses: list[Course] | None = None,
 ) -> list[dict]:
     """Get courses happening on target_date with their start times."""
     semester_start_str = config.get("semester_start", "")
@@ -96,11 +104,15 @@ def _get_today_courses(
     period_times = config.get("period_start_times", DEFAULT_PERIOD_TIMES)
 
     # Compute current week number (1-based)
-    delta_days = (target_date - semester_start).days
+    # Align to the Monday of the semester_start week so that week numbers
+    # are correct even if semester_start is not a Monday.
+    semester_monday = semester_start - timedelta(days=semester_start.weekday())
+    delta_days = (target_date - semester_monday).days
     if delta_days < 0:
         return []
     current_week = delta_days // 7 + 1
     target_weekday = target_date.weekday()
+    label_context = label_courses or courses
 
     result = []
     for course in courses:
@@ -118,10 +130,12 @@ def _get_today_courses(
                 if start_time:
                     result.append({
                         "name": course.name,
+                        "label": get_course_selector(course, label_context),
                         "teacher": course.teacher,
                         "location": location,
                         "time": start_time,
                         "period": first_period,
+                        "course_key": getattr(course, "course_key", course.name),
                         "visibility": getattr(course, "visibility", "public"),
                         "owner_id": getattr(course, "owner_id", ""),
                     })
@@ -162,23 +176,36 @@ async def generate_course_reminders_for_date(target_date: date | None = None):
     advance_label = _format_advance_label(advance_minutes)
 
     all_courses = get_all_courses(include_all_private=True)
-    today_courses = _get_today_courses(all_courses, config, target_date)
+    today_courses = _get_today_courses(
+        all_courses,
+        config,
+        target_date,
+        label_courses=all_courses,
+    )
+
+    now = datetime.now()
+    existing_rows = await list_unsent_reminders_by_date("course", date_str)
+    existing_due_keys = {
+        (row["user_id"], row["ref_id"], row["remind_at"])
+        for row in existing_rows
+        if datetime.strptime(row["remind_at"], "%Y-%m-%d %H:%M") <= now
+    }
+    existing_ref_pairs = {
+        (row["user_id"], row["ref_id"])
+        for row in existing_rows
+    }
 
     # Only users who opted in to class notifications
     notify_subs = await get_class_notify_subscribers()
 
-    # Delete all future course reminders for today (regenerate)
-    await delete_future_reminders_by_date("course", date_str)
-
-    now = datetime.now()
     morning_dt = datetime.combine(target_date, datetime.strptime(
         f"{MORNING_REMIND_HOUR}:{MORNING_REMIND_MINUTE:02d}", "%H:%M"
     ).time())
 
     # Group today's courses by recipient for morning summary
     user_morning_courses: dict[str, list[dict]] = {}
+    desired_reminders: dict[tuple[str, str], list[ReminderDraft]] = {}
 
-    added = 0
     for c in today_courses:
         try:
             class_start = datetime.combine(
@@ -187,20 +214,20 @@ async def generate_course_reminders_for_date(target_date: date | None = None):
         except ValueError:
             continue
 
-        ref_id = f"{c['name']}@{date_str}@{c['period']}"
+        ref_id = f"{c['course_key']}@{date_str}@{c['period']}"
 
         location_info = f"\n  地点: {c['location']}" if c["location"] != "未安排" else ""
         body_advance = (
             f"上课提醒 ({advance_label}):\n"
-            f"  {c['name']}  (第{c['period']}节 {c['time']})\n"
+            f"  {c.get('label', c['name'])}  (第{c['period']}节 {c['time']})\n"
             f"  教师: {c['teacher']}{location_info}"
         )
 
         if c.get("visibility") == "private":
             owner_id = c.get("owner_id", "")
-            recipients = [owner_id] if owner_id in notify_subs.get(c["name"], []) else []
+            recipients = [owner_id] if owner_id in notify_subs.get(c["course_key"], []) else []
         else:
-            recipients = notify_subs.get(c["name"], [])
+            recipients = notify_subs.get(c["course_key"], [])
 
         for user_id in recipients:
             # Collect for morning summary
@@ -208,41 +235,53 @@ async def generate_course_reminders_for_date(target_date: date | None = None):
 
             # Advance reminder before class
             remind_advance = class_start - timedelta(minutes=advance_minutes)
-            if remind_advance > now:
-                await add_reminder(
-                    ReminderDraft(
-                        type="course",
-                        ref_id=f"{ref_id}@advance",
-                        title=f"上课: {c['name']}",
-                        body=body_advance,
-                        remind_at=remind_advance.strftime("%Y-%m-%d %H:%M"),
-                        user_id=user_id,
-                    )
-                )
-                added += 1
-
-    # Generate morning summary reminders
-    if morning_dt > now:
-        for user_id, courses in user_morning_courses.items():
-            courses_sorted = sorted(courses, key=lambda x: x["time"])
-            lines = [f"今日课程提醒 ({target_date.strftime('%m月%d日')}):"]
-            for c in courses_sorted:
-                loc = f" @ {c['location']}" if c["location"] != "未安排" else ""
-                lines.append(f"  第{c['period']}节 {c['time']}  {c['name']}{loc}")
-            await add_reminder(
-                ReminderDraft(
-                    type="course",
-                    ref_id=f"morning@{date_str}@{user_id}",
-                    title="今日课程",
-                    body="\n".join(lines),
-                    remind_at=morning_dt.strftime("%Y-%m-%d %H:%M"),
-                    user_id=user_id,
-                )
+            remind_at = remind_advance.strftime("%Y-%m-%d %H:%M")
+            draft = ReminderDraft(
+                type="course",
+                ref_id=f"{ref_id}@advance",
+                title=f"上课: {c.get('label', c['name'])}",
+                body=body_advance,
+                remind_at=remind_at,
+                user_id=user_id,
             )
-            added += 1
+            if remind_advance > now or (
+                user_id,
+                draft.ref_id,
+                draft.remind_at,
+            ) in existing_due_keys:
+                desired_reminders[(user_id, draft.ref_id)] = [draft]
 
-    if added:
-        logger.info(f"Generated {added} course reminders for {date_str}")
+    for user_id, courses in user_morning_courses.items():
+        courses_sorted = sorted(courses, key=lambda x: x["time"])
+        lines = [f"今日课程提醒 ({target_date.strftime('%m月%d日')}):"]
+        for c in courses_sorted:
+            loc = f" @ {c['location']}" if c["location"] != "未安排" else ""
+            lines.append(f"  第{c['period']}节 {c['time']}  {c.get('label', c['name'])}{loc}")
+
+        remind_at = morning_dt.strftime("%Y-%m-%d %H:%M")
+        ref_id = f"morning@{date_str}@{user_id}"
+        draft = ReminderDraft(
+            type="course",
+            ref_id=ref_id,
+            title="今日课程",
+            body="\n".join(lines),
+            remind_at=remind_at,
+            user_id=user_id,
+        )
+        if morning_dt > now or (user_id, ref_id, remind_at) in existing_due_keys:
+            desired_reminders[(user_id, ref_id)] = [draft]
+
+    for (user_id, ref_id), drafts in desired_reminders.items():
+        await sync_reminders("course", ref_id, drafts, user_id)
+
+    desired_ref_pairs = set(desired_reminders)
+    stale_pairs = existing_ref_pairs - desired_ref_pairs
+    for user_id, ref_id in stale_pairs:
+        await delete_reminders_by_ref("course", ref_id, user_id=user_id)
+
+    delta = len(desired_ref_pairs) - len(stale_pairs)
+    if delta:
+        logger.info(f"Synced {len(desired_ref_pairs)} course reminder refs for {date_str}")
 
 
 # Run daily at 00:05 to generate today's course reminders
@@ -262,7 +301,12 @@ def get_today_schedule() -> list[dict]:
     if not config:
         return []
     all_courses = get_all_courses()
-    return _get_today_courses(all_courses, config, date.today())
+    return _get_today_courses(
+        all_courses,
+        config,
+        date.today(),
+        label_courses=all_courses,
+    )
 
 
 async def get_today_schedule_for_user(user_id: str) -> list[dict]:
@@ -270,7 +314,12 @@ async def get_today_schedule_for_user(user_id: str) -> list[dict]:
     config = _load_config()
     if not config:
         return []
-    all_courses = get_all_courses(user_id=user_id)
+    visible_courses = get_all_courses(user_id=user_id)
     subscriptions = set(await get_subscriptions(user_id))
-    filtered = [c for c in all_courses if c.name in subscriptions]
-    return _get_today_courses(filtered, config, date.today())
+    filtered = [c for c in visible_courses if c.course_key in subscriptions]
+    return _get_today_courses(
+        filtered,
+        config,
+        date.today(),
+        label_courses=visible_courses,
+    )

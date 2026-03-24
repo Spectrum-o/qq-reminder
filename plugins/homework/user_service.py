@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 from .config import OWNER_QQ
-from .course_parser import get_all_courses
+from .course_parser import (
+    Course,
+    build_course_key_selector_map,
+    build_course_selector_map,
+    get_all_courses,
+)
 from .database import (
     add_subscriptions,
     create_pending_user,
     delete_user,
     get_all_approved_user_ids,
     get_subscribers_for_course,
+    get_subscription_names,
     get_subscriptions,
     get_user,
     list_users as db_list_users,
@@ -95,40 +101,130 @@ async def remove_user(qq_id: str) -> bool:
 # ── Course subscription ──────────────────────────────
 
 
-def _visible_course_names(user_id: str) -> list[str]:
-    names: list[str] = []
-    seen: set[str] = set()
-    for course in get_all_courses(user_id=user_id):
-        if course.name in seen:
+def get_visible_course_selector_map(user_id: str) -> dict[str, Course]:
+    courses = get_all_courses(user_id=user_id)
+    return build_course_selector_map(courses)
+
+
+def _visible_course_key_map(user_id: str) -> dict[str, str]:
+    return build_course_key_selector_map(get_all_courses(user_id=user_id))
+
+
+def resolve_visible_course(user_id: str, selector: str) -> Course | None:
+    return get_visible_course_selector_map(user_id).get(selector)
+
+
+def get_visible_course_selectors(user_id: str) -> list[str]:
+    return list(get_visible_course_selector_map(user_id))
+
+
+async def subscribe_courses(user_id: str, course_selectors: list[str]) -> list[str]:
+    """Subscribe user to courses. Returns list of newly subscribed selectors."""
+    selector_map = get_visible_course_selector_map(user_id)
+    selected_courses = []
+    seen_keys: set[str] = set()
+    for selector in course_selectors:
+        course = selector_map.get(selector)
+        if course is None or course.course_key in seen_keys:
             continue
-        seen.add(course.name)
-        names.append(course.name)
-    return names
+        seen_keys.add(course.course_key)
+        selected_courses.append(course)
 
-
-async def subscribe_courses(user_id: str, course_names: list[str]) -> list[str]:
-    """Subscribe user to courses. Returns list of newly subscribed names."""
-    visible_names = set(_visible_course_names(user_id))
-    valid_course_names = [name for name in course_names if name in visible_names]
-    if not valid_course_names:
+    if not selected_courses:
         return []
-    return await add_subscriptions(user_id, valid_course_names)
+
+    added_keys = await add_subscriptions(
+        user_id,
+        [
+            (course.course_key, course.name)
+            for course in selected_courses
+        ],
+    )
+    added_key_set = set(added_keys)
+    return [
+        selector
+        for selector, course in selector_map.items()
+        if course.course_key in added_key_set
+    ]
 
 
-async def unsubscribe_courses(user_id: str, course_names: list[str]) -> list[str]:
-    """Unsubscribe user from courses. Returns list of actually removed names."""
-    return await remove_subscriptions(user_id, course_names)
+async def unsubscribe_courses(user_id: str, course_selectors: list[str]) -> list[str]:
+    """Unsubscribe user from courses. Returns list of actually removed selectors."""
+    selector_map = get_visible_course_selector_map(user_id)
+    selected_courses = []
+    seen_keys: set[str] = set()
+    for selector in course_selectors:
+        course = selector_map.get(selector)
+        if course is None or course.course_key in seen_keys:
+            continue
+        seen_keys.add(course.course_key)
+        selected_courses.append(course)
+
+    if not selected_courses:
+        return []
+
+    removed_keys = await remove_subscriptions(
+        user_id, [course.course_key for course in selected_courses]
+    )
+    removed_key_set = set(removed_keys)
+    return [
+        selector
+        for selector, course in selector_map.items()
+        if course.course_key in removed_key_set
+    ]
+
+
+async def get_user_subscription_keys(user_id: str) -> list[str]:
+    subscriptions = await get_subscriptions(user_id)
+    visible_key_map = _visible_course_key_map(user_id)
+    return [key for key in subscriptions if key in visible_key_map]
 
 
 async def get_user_subscriptions(user_id: str) -> list[str]:
-    subscriptions = await get_subscriptions(user_id)
-    visible_names = set(_visible_course_names(user_id))
-    return [name for name in subscriptions if name in visible_names]
+    visible_key_map = _visible_course_key_map(user_id)
+    return [
+        visible_key_map[key]
+        for key in await get_user_subscription_keys(user_id)
+    ]
+
+
+async def get_user_subscription_selector_map(user_id: str) -> dict[str, str]:
+    visible_key_map = _visible_course_key_map(user_id)
+    return {
+        visible_key_map[key]: key
+        for key in await get_user_subscription_keys(user_id)
+    }
+
+
+async def get_user_subscription_name_map(user_id: str) -> dict[str, str]:
+    selector_map = get_visible_course_selector_map(user_id)
+    subscribed_keys = set(await get_user_subscription_keys(user_id))
+    return {
+        selector: course.name
+        for selector, course in selector_map.items()
+        if course.course_key in subscribed_keys
+    }
+
+
+async def get_user_subscription_names(user_id: str) -> list[str]:
+    return await get_subscription_names(user_id)
 
 
 async def subscribe_all_courses(user_id: str) -> list[str]:
-    """Subscribe user to all public courses + user's own private courses."""
-    course_names = _visible_course_names(user_id)
-    if not course_names:
+    """Subscribe user to all visible courses."""
+    selector_map = get_visible_course_selector_map(user_id)
+    if not selector_map:
         return []
-    return await add_subscriptions(user_id, course_names)
+    added_keys = await add_subscriptions(
+        user_id,
+        [
+            (course.course_key, course.name)
+            for course in selector_map.values()
+        ],
+    )
+    added_key_set = set(added_keys)
+    return [
+        selector
+        for selector, course in selector_map.items()
+        if course.course_key in added_key_set
+    ]

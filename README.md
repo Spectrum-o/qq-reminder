@@ -188,6 +188,9 @@ LLM_MODEL=deepseek-ai/DeepSeek-V3.2
 | `/notify <课程名>` | 开启/关闭该课程的上课提醒 | |
 
 `root` 用户启动时自动订阅所有课程。新用户审批后需手动订阅。
+如果课程名本身包含空格，订阅/退订多个课程时建议用分号分隔，例如：
+`/subscribe English Writing; Data Structures`
+如果出现同名公共课，列表中会显示为 `课程名#课程编号`，订阅和课程提醒开关也请按该格式输入。
 
 ---
 

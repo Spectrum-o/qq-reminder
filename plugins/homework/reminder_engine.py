@@ -4,7 +4,7 @@ from nonebot.log import logger
 require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler  # noqa: E402
 
-from .database import get_pending_reminders, mark_reminder_sent, cleanup_old_reminders  # noqa: E402
+from .database import get_pending_reminders, mark_reminder_sent, cleanup_old_reminders, increment_reminder_fail_count, REMINDER_MAX_FAIL_COUNT  # noqa: E402
 from .config import OWNER_QQ  # noqa: E402
 
 
@@ -38,7 +38,17 @@ async def dispatch_reminders():
         try:
             await bot.send_private_msg(user_id=target_qq, message=r["body"])
         except Exception as exc:
-            logger.error(f"Failed to send reminder #{r['id']} to {target_qq}: {exc}")
+            fail_count = await increment_reminder_fail_count(r["id"])
+            if fail_count >= REMINDER_MAX_FAIL_COUNT:
+                logger.error(
+                    f"Reminder #{r['id']} to {target_qq} permanently failed after "
+                    f"{fail_count} attempts: {exc}"
+                )
+            else:
+                logger.warning(
+                    f"Failed to send reminder #{r['id']} to {target_qq} "
+                    f"(attempt {fail_count}/{REMINDER_MAX_FAIL_COUNT}): {exc}"
+                )
             continue
 
         await mark_reminder_sent(r["id"])

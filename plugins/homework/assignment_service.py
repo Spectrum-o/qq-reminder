@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 
 from nonebot.log import logger
 
+from .course_parser import build_course_key_selector_map, get_all_courses
 from .database import (
     count_assignments,
     count_assignments_by_course,
@@ -14,8 +15,9 @@ from .database import (
     delete_reminders_by_ref,
     get_all_approved_user_ids,
     get_assignment,
-    get_subscribers_for_course,
     get_subscriptions,
+    get_subscription_names,
+    get_subscribers_for_course,
     is_assignment_done_by,
     list_all_assignments,
     list_pending,
@@ -39,6 +41,38 @@ from .time_parser import parse_natural_deadline
 
 def parse_command_deadline(deadline_text: str) -> str:
     return parse_natural_deadline(deadline_text)
+
+
+def _is_precise_course_key(course_key: str | None) -> bool:
+    return bool(course_key) and not course_key.startswith("legacy:")
+
+
+def _build_visible_course_label_map(user_id: str) -> dict[str, str]:
+    return build_course_key_selector_map(get_all_courses(user_id=user_id))
+
+
+def _get_assignment_course_label(
+    row: dict, course_labels: dict[str, str]
+) -> str:
+    course_key = str(row.get("course_key", "") or "")
+    if _is_precise_course_key(course_key):
+        return course_labels.get(course_key, row["course"])
+    return row["course"]
+
+
+def _is_assignment_visible_to_user(
+    row: dict,
+    user_id: str,
+    subscription_keys: set[str],
+    subscription_names: set[str],
+) -> bool:
+    if row.get("visibility") == "private" and row.get("owner_id") != user_id:
+        return False
+
+    course_key = str(row.get("course_key", "") or "")
+    if _is_precise_course_key(course_key):
+        return course_key in subscription_keys
+    return row["course"] in subscription_names
 
 
 def _build_homework_reminders(
@@ -76,10 +110,14 @@ def _build_homework_reminders(
 
 
 async def sync_homework_reminders(
-    assignment_id: int, course: str, description: str, deadline: str
+    assignment_id: int,
+    course: str,
+    description: str,
+    deadline: str,
+    course_key: str = "",
 ) -> None:
     """Generate/sync homework reminders for all subscribers of this course."""
-    subscribers = await get_subscribers_for_course(course)
+    subscribers = await get_subscribers_for_course(course, course_key)
     for user_id in subscribers:
         if await is_assignment_done_by(user_id, assignment_id):
             continue
@@ -92,11 +130,8 @@ async def sync_homework_reminders(
 async def sync_homework_reminders_for_user(user_id: str) -> None:
     """Regenerate all homework reminders for a specific user.
     Called when user subscribes to new courses."""
-    subscriptions = set(await get_subscriptions(user_id))
     rows = await list_undone_assignments(user_id)
     for row in rows:
-        if row.get("visibility") != "private" and row["course"] not in subscriptions:
-            continue
         reminders = _build_homework_reminders(
             row["id"], row["course"], row["description"], row["deadline"], user_id
         )
@@ -110,6 +145,7 @@ async def apply_assignment_sync_outcome(outcome: SyncOutcome) -> None:
             record["course"],
             record["description"],
             record["deadline"],
+            record.get("course_key", "") or "",
         )
 
     for assignment_id in outcome.removed_ids:
@@ -118,10 +154,11 @@ async def apply_assignment_sync_outcome(outcome: SyncOutcome) -> None:
 
 async def add_manual_assignment(
     course: str, description: str, deadline: str,
-    visibility: str = "public", owner_id: str = "",
+    visibility: str = "public", owner_id: str = "", course_key: str = "",
 ) -> int:
     draft = AssignmentDraft(
         course=course,
+        course_key=course_key,
         description=description,
         deadline=deadline,
         source_type=SOURCE_MANUAL,
@@ -130,12 +167,28 @@ async def add_manual_assignment(
     )
     assignment_id = await create_assignment(draft)
     if visibility == "private":
+        subscription_keys = set(await get_subscriptions(owner_id))
+        subscription_names = set(await get_subscription_names(owner_id))
+        if not _is_assignment_visible_to_user(
+            {
+                "course": course,
+                "course_key": course_key,
+                "visibility": visibility,
+                "owner_id": owner_id,
+            },
+            owner_id,
+            subscription_keys,
+            subscription_names,
+        ):
+            return assignment_id
         reminders = _build_homework_reminders(
             assignment_id, course, description, deadline, owner_id
         )
         await sync_reminders("homework", str(assignment_id), reminders, owner_id)
     else:
-        await sync_homework_reminders(assignment_id, course, description, deadline)
+        await sync_homework_reminders(
+            assignment_id, course, description, deadline, course_key
+        )
     return assignment_id
 
 
@@ -146,6 +199,7 @@ async def list_pending_message(user_id: str) -> str:
 
     lines = ["待完成作业:"]
     now = datetime.now()
+    course_labels = _build_visible_course_label_map(user_id)
     for row in rows:
         try:
             deadline_dt = datetime.strptime(row["deadline"], STORED_DATETIME_FORMAT)
@@ -160,7 +214,8 @@ async def list_pending_message(user_id: str) -> str:
         except ValueError:
             time_left = ""
 
-        lines.append(f"  #{row['id']}  [{row['course']}] {row['description']}{' [私]' if row.get('visibility') == 'private' else ''}")
+        course_label = _get_assignment_course_label(row, course_labels)
+        lines.append(f"  #{row['id']}  [{course_label}] {row['description']}{' [私]' if row.get('visibility') == 'private' else ''}")
         lines.append(f"       截止: {row['deadline']}  ({time_left})")
     return "\n".join(lines)
 
@@ -169,13 +224,12 @@ async def complete_assignment(user_id: str, assignment_id: int) -> bool:
     assignment = await get_assignment(assignment_id)
     if not assignment:
         return False
-    if assignment.get("visibility") == "private":
-        if assignment.get("owner_id") != user_id:
-            return False
-    else:
-        subscriptions = set(await get_subscriptions(user_id))
-        if assignment["course"] not in subscriptions:
-            return False
+    subscription_keys = set(await get_subscriptions(user_id))
+    subscription_names = set(await get_subscription_names(user_id))
+    if not _is_assignment_visible_to_user(
+        assignment, user_id, subscription_keys, subscription_names
+    ):
+        return False
     ok = await mark_done(user_id, assignment_id)
     if ok:
         await delete_reminders_by_ref("homework", str(assignment_id), user_id=user_id)
@@ -216,14 +270,13 @@ async def backfill_homework_reminders() -> None:
         return
 
     for user_id in user_ids:
-        subscriptions = set(await get_subscriptions(user_id))
+        subscription_keys = set(await get_subscriptions(user_id))
+        subscription_names = set(await get_subscription_names(user_id))
         for row in rows:
-            if row.get("visibility") == "private":
-                if row.get("owner_id") != user_id:
-                    continue
-            else:
-                if row["course"] not in subscriptions:
-                    continue
+            if not _is_assignment_visible_to_user(
+                row, user_id, subscription_keys, subscription_names
+            ):
+                continue
             if await is_assignment_done_by(user_id, row["id"]):
                 continue
             reminders = _build_homework_reminders(
@@ -232,9 +285,43 @@ async def backfill_homework_reminders() -> None:
             await sync_reminders("homework", str(row["id"]), reminders, user_id)
 
 
-def _json_source_key(course: str, description: str, deadline: str) -> str:
+def _resolve_public_course_reference(
+    course_name: str,
+    *,
+    course_selector: str = "",
+    course_key: str = "",
+) -> tuple[str, str]:
+    public_courses = get_all_courses()
+    course_by_key = {course.course_key: course for course in public_courses}
+    selector_map = build_course_key_selector_map(public_courses)
+
+    if course_key:
+        matched_course = course_by_key.get(course_key)
+        if matched_course is None:
+            raise ValueError(f"unknown course_key {course_key}")
+        return matched_course.name, matched_course.course_key
+
+    if course_selector:
+        for matched_key, selector in selector_map.items():
+            if selector == course_selector:
+                return course_by_key[matched_key].name, matched_key
+        raise ValueError(f"unknown course_selector {course_selector}")
+
+    matches = [course for course in public_courses if course.name == course_name]
+    if len(matches) == 1:
+        return matches[0].name, matches[0].course_key
+    if len(matches) > 1:
+        raise ValueError(
+            f"ambiguous course {course_name}, use course_key or course_selector"
+        )
+    return course_name, ""
+
+
+def _json_source_key(
+    course: str, description: str, deadline: str, course_key: str = ""
+) -> str:
     payload = json.dumps(
-        [course, description, deadline],
+        [course_key or course, course, description, deadline],
         ensure_ascii=False,
         separators=(",", ":"),
     )
@@ -263,10 +350,12 @@ def _load_json_assignment_drafts() -> list[AssignmentDraft] | None:
             continue
 
         course = str(item.get("course", "")).strip()
+        course_key = str(item.get("course_key", "")).strip()
+        course_selector = str(item.get("course_selector", "")).strip()
         description = str(item.get("description", "")).strip()
         deadline = str(item.get("deadline", "")).strip()
         source_key = str(item.get("id", "")).strip()
-        if not (course and description and deadline):
+        if not ((course or course_key or course_selector) and description and deadline):
             logger.warning(f"assignments.json item #{index} is incomplete, skipped")
             continue
         try:
@@ -277,8 +366,18 @@ def _load_json_assignment_drafts() -> list[AssignmentDraft] | None:
             )
             continue
 
+        try:
+            course, course_key = _resolve_public_course_reference(
+                course,
+                course_selector=course_selector,
+                course_key=course_key,
+            )
+        except ValueError as exc:
+            logger.warning(f"assignments.json item #{index} {exc}, skipped")
+            continue
+
         if not source_key:
-            source_key = _json_source_key(course, description, deadline)
+            source_key = _json_source_key(course, description, deadline, course_key)
         if source_key in seen_keys:
             logger.warning(
                 f"assignments.json item #{index} has duplicate id/source key {source_key}, skipped"
@@ -289,6 +388,7 @@ def _load_json_assignment_drafts() -> list[AssignmentDraft] | None:
         drafts.append(
             AssignmentDraft(
                 course=course,
+                course_key=course_key,
                 description=description,
                 deadline=deadline,
                 source_type=SOURCE_JSON,
