@@ -4,13 +4,21 @@ from nonebot.log import logger
 require("nonebot_plugin_apscheduler")
 from nonebot_plugin_apscheduler import scheduler  # noqa: E402
 
-from .database import get_pending_reminders, mark_reminder_sent, cleanup_old_reminders, increment_reminder_fail_count, REMINDER_MAX_FAIL_COUNT  # noqa: E402
+from .database import cleanup_old_reminders, delete_expired_homework_reminders, get_pending_reminders, increment_reminder_fail_count, mark_reminder_sent, mark_terminal_failed_reminders_sent, REMINDER_MAX_FAIL_COUNT  # noqa: E402
+from .daily_reminder_service import sync_daily_reminder_occurrences  # noqa: E402
 from .config import OWNER_QQ  # noqa: E402
 
 
 @scheduler.scheduled_job("interval", minutes=2, id="reminder_dispatch")
 async def dispatch_reminders():
     """Scan for due reminders and send them to the correct user."""
+    normalized_count = await mark_terminal_failed_reminders_sent()
+    if normalized_count:
+        logger.info(f"Normalized {normalized_count} terminal failed reminders")
+    deleted_count = await delete_expired_homework_reminders()
+    if deleted_count:
+        logger.info(f"Deleted {deleted_count} expired homework reminders")
+    await sync_daily_reminder_occurrences()
     try:
         bot = get_bot()
     except ValueError:
@@ -18,6 +26,11 @@ async def dispatch_reminders():
         return
 
     rows = await get_pending_reminders()
+    await _dispatch_pending_rows(bot, rows)
+
+
+async def _dispatch_pending_rows(bot, rows: list[dict]) -> None:
+    """Send a batch of already-selected due reminders."""
     for r in rows:
         user_id = r.get("user_id", "")
         if not user_id:
@@ -44,6 +57,7 @@ async def dispatch_reminders():
                     f"Reminder #{r['id']} to {target_qq} permanently failed after "
                     f"{fail_count} attempts: {exc}"
                 )
+                await mark_reminder_sent(r["id"])
             else:
                 logger.warning(
                     f"Failed to send reminder #{r['id']} to {target_qq} "

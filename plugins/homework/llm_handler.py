@@ -23,6 +23,7 @@ from .config import (
     LLM_USER_RATE_LIMIT_WINDOW_SECONDS,
 )
 from .agenda_service import build_agenda_message
+from .commands import build_add_response, extract_add_shortcut_payload
 from .course_service import format_today_schedule_for_user
 from .public_info import (
     get_local_public_reply,
@@ -39,11 +40,17 @@ _llm_request_windows: dict[str, deque[float]] = defaultdict(deque)
 _llm_daily_counts: dict[str, tuple[str, int]] = {}
 _llm_global_window: deque[float] = deque()
 _pending_briefing_followups: dict[str, float] = {}
+_pending_briefing_content_followups: dict[str, float] = {}
 
 _BRIEFING_FOLLOWUP_TTL_SECONDS = 300
 _BRIEFING_TIME_CANDIDATE_RE = re.compile(
     r"(\d{1,2}\s*[:：]\s*\d{1,2}|\d{1,2}\s*(?:点|时)(?:半|\d{1,2}分?)?)"
 )
+_BRIEFING_SECTION_ALIASES = {
+    "courses": ("课程", "课表"),
+    "assignments": ("作业", "任务"),
+    "reminders": ("提醒", "待办"),
+}
 
 
 @dataclass(frozen=True)
@@ -148,11 +155,15 @@ def _prune_pending_briefing_followups(now: float | None = None) -> None:
     current = now if now is not None else monotonic()
     stale_users = [
         user_id
-        for user_id, expires_at in _pending_briefing_followups.items()
+        for user_id, expires_at in {
+            **_pending_briefing_followups,
+            **_pending_briefing_content_followups,
+        }.items()
         if expires_at <= current
     ]
     for user_id in stale_users:
-        del _pending_briefing_followups[user_id]
+        _pending_briefing_followups.pop(user_id, None)
+        _pending_briefing_content_followups.pop(user_id, None)
 
 
 def _extract_briefing_value(text: str) -> str | None:
@@ -182,30 +193,62 @@ def _extract_briefing_value(text: str) -> str | None:
     return None
 
 
-def _is_briefing_update_intent(text: str) -> bool:
+def _extract_briefing_content_update(text: str) -> tuple[str, list[str]] | None:
+    normalized = text.strip()
+    if not normalized:
+        return None
+
+    if any(token in normalized for token in ("全部", "默认", "恢复默认")):
+        return "set", ["courses", "assignments", "reminders"]
+
+    sections = [
+        key
+        for key, aliases in _BRIEFING_SECTION_ALIASES.items()
+        if any(alias in normalized for alias in aliases)
+    ]
+    if not sections:
+        return None
+
+    if any(token in normalized for token in ("只保留", "只看", "只显示", "仅保留", "仅显示", "只留")):
+        mode = "set"
+    elif any(token in normalized for token in ("不要", "去掉", "隐藏", "移除", "删掉", "删除")):
+        mode = "remove"
+    elif any(token in normalized for token in ("加上", "加入", "打开", "开启", "显示", "保留")):
+        mode = "add"
+    else:
+        mode = "set"
+    return mode, sections
+
+
+def _is_briefing_content_intent(text: str) -> bool:
     normalized = text.strip()
     if "早报" not in normalized:
         return False
-
     return any(
         token in normalized
-        for token in (
-            "修改",
-            "改成",
-            "改到",
-            "改下",
-            "改一下",
-            "改",
-            "调整",
-            "设置",
-            "调到",
-            "调成",
-            "关掉",
-            "关闭",
-            "开启",
-            "打开",
-            "恢复",
-        )
+        for token in ("内容", "显示", "展示", "保留", "加入", "加上", "不要", "隐藏", "去掉", "移除")
+    )
+
+
+def _is_briefing_time_update_intent(text: str) -> bool:
+    normalized = text.strip()
+    if "早报" not in normalized or _is_briefing_content_intent(normalized):
+        return False
+    if _extract_briefing_value(normalized) is not None:
+        return True
+    return any(
+        token in normalized
+        for token in ("时间", "几点", "几点发", "几点发送", "关掉", "关闭", "开启", "打开", "恢复")
+    )
+
+
+def _is_briefing_general_update_intent(text: str) -> bool:
+    normalized = text.strip()
+    if "早报" not in normalized:
+        return False
+    return any(
+        token in normalized
+        for token in ("修改", "改成", "改到", "改下", "改一下", "改", "调整", "设置", "调到", "调成")
     )
 
 
@@ -217,29 +260,67 @@ async def _try_handle_local_briefing_message(
     _prune_pending_briefing_followups()
 
     value = _extract_briefing_value(text)
+    content_update = _extract_briefing_content_update(text)
     if user_id in _pending_briefing_followups and value is not None:
         _pending_briefing_followups.pop(user_id, None)
+        _pending_briefing_content_followups.pop(user_id, None)
         return await llm_service._execute_tool(
             "set_briefing_time",
             {"value": value},
             user_id,
             role,
         )
+    if user_id in _pending_briefing_content_followups:
+        if content_update is not None:
+            _pending_briefing_content_followups.pop(user_id, None)
+            _pending_briefing_followups.pop(user_id, None)
+            mode, sections = content_update
+            return await llm_service._execute_tool(
+                "set_briefing_content",
+                {"mode": mode, "sections": sections},
+                user_id,
+                role,
+            )
+        return "你想让早报显示哪些部分？可选：课程、作业、提醒。比如：只保留作业和提醒。"
 
-    if not _is_briefing_update_intent(text):
-        return None
-
-    if value is not None:
+    if _is_briefing_content_intent(text):
+        if content_update is not None:
+            _pending_briefing_followups.pop(user_id, None)
+            mode, sections = content_update
+            return await llm_service._execute_tool(
+                "set_briefing_content",
+                {"mode": mode, "sections": sections},
+                user_id,
+                role,
+            )
+        _pending_briefing_content_followups[user_id] = monotonic() + _BRIEFING_FOLLOWUP_TTL_SECONDS
         _pending_briefing_followups.pop(user_id, None)
-        return await llm_service._execute_tool(
-            "set_briefing_time",
-            {"value": value},
-            user_id,
-            role,
+        return "你想让早报显示哪些部分？可选：课程、作业、提醒。比如：只保留作业和提醒。"
+
+    if _is_briefing_time_update_intent(text):
+        if value is not None:
+            _pending_briefing_followups.pop(user_id, None)
+            _pending_briefing_content_followups.pop(user_id, None)
+            return await llm_service._execute_tool(
+                "set_briefing_time",
+                {"value": value},
+                user_id,
+                role,
+            )
+
+        _pending_briefing_followups[user_id] = monotonic() + _BRIEFING_FOLLOWUP_TTL_SECONDS
+        _pending_briefing_content_followups.pop(user_id, None)
+        return "你想把每日早报改到几点？直接回复时间就行，比如 7:30。"
+
+    if _is_briefing_general_update_intent(text):
+        _pending_briefing_followups.pop(user_id, None)
+        _pending_briefing_content_followups.pop(user_id, None)
+        return (
+            "你想改早报时间，还是改显示内容？"
+            "比如“改到 7:30”或“只保留作业和提醒”。"
         )
 
-    _pending_briefing_followups[user_id] = monotonic() + _BRIEFING_FOLLOWUP_TTL_SECONDS
-    return "你想把每日早报改到几点？直接回复时间就行，比如 7:30。"
+    return None
 
 
 @llm_fallback.handle()
@@ -287,6 +368,10 @@ async def handle_llm_fallback(bot: Bot, event: PrivateMessageEvent):
     local_briefing_reply = await _try_handle_local_briefing_message(text, user_id, role)
     if local_briefing_reply:
         await llm_fallback.finish(local_briefing_reply)
+
+    add_shortcut_payload = extract_add_shortcut_payload(text)
+    if add_shortcut_payload is not None:
+        await llm_fallback.finish(await build_add_response(user_id, add_shortcut_payload))
 
     allowed, deny_message = _allow_llm_request(user_id, _USER_POLICY)
     if not allowed:

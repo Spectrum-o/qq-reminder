@@ -68,6 +68,35 @@ async def set_user_role(qq_id: str, role: str) -> bool:
     return await update_user_role(qq_id, role)
 
 
+async def promote_user_to_admin(qq_id: str, approver_qq: str) -> bool:
+    """Promote an existing normal user to admin. Root-only caller check happens upstream."""
+    user = await get_user(qq_id)
+    if user is None or user["role"] != ROLE_USER:
+        return False
+    return await update_user_role(qq_id, ROLE_ADMIN, approved_by=approver_qq)
+
+
+def build_role_notice(role: str, *, promoted: bool = False) -> str:
+    if role == ROLE_ADMIN:
+        title = "你已被设置为管理员" if promoted else "你的注册已通过审核，已授予管理员权限"
+        return "\n".join(
+            [
+                title,
+                "发送 /help 查看所有功能",
+                "你现在可以管理公共课程、公共作业和用户审批",
+            ]
+        )
+
+    return "\n".join(
+        [
+            "你的注册已通过审核 (角色: 用户)",
+            "发送 /help 查看所有功能",
+            "发送 /agenda 查看事项总览",
+            "发送 /subscribe 查看可选课程并按需订阅",
+        ]
+    )
+
+
 async def is_approved(qq_id: str) -> bool:
     role = await get_user_role(qq_id)
     return role in _APPROVED_ROLES

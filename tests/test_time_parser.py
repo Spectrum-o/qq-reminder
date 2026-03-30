@@ -25,3 +25,13 @@ def test_parse_natural_deadline_supports_this_week_with_explicit_time():
 def test_parse_natural_deadline_supports_next_week_with_deadline_suffix():
     with patch("plugins.homework.time_parser.datetime", _FrozenDateTime):
         assert parse_natural_deadline("下周一截止") == "2026-03-30 23:59"
+
+
+def test_parse_natural_deadline_supports_numeric_weekday_with_spaces():
+    with patch("plugins.homework.time_parser.datetime", _FrozenDateTime):
+        assert parse_natural_deadline("下周 4") == "2026-04-02 23:59"
+
+
+def test_parse_natural_deadline_supports_spaced_chinese_date():
+    with patch("plugins.homework.time_parser.datetime", _FrozenDateTime):
+        assert parse_natural_deadline("4 月 15 日 18:00") == "2026-04-15 18:00"

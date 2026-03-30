@@ -10,23 +10,25 @@ DEFAULT_TIME = "23:59"
 WEEKDAY_MAP = {
     "一": 0, "二": 1, "三": 2, "四": 3,
     "五": 4, "六": 5, "日": 6, "天": 6,
+    "1": 0, "2": 1, "3": 2, "4": 3,
+    "5": 4, "6": 5, "7": 6,
 }
 
 # ── 正则 ──────────────────────────────────────────
 
 _RE_RELATIVE_DAY = re.compile(
     r"^(今天|明天|后天|大后天)"
-    r"(?:[-:]?(\d{1,2}:\d{2}))?$"
+    r"(?:\s*[-:：]?\s*(\d{1,2}:\d{2}))?$"
 )
 
 _RE_WEEKDAY = re.compile(
-    r"^((?:这周|本周|下周|周)([一二三四五六日天]))"
-    r"(?:[-:]?(\d{1,2}:\d{2}))?$"
+    r"^(?:这周|本周|下周|周)\s*([一二三四五六日天1-7])"
+    r"(?:\s*[-:：]?\s*(\d{1,2}:\d{2}))?$"
 )
 
 _RE_CHINESE_DATE = re.compile(
-    r"^(\d{1,2})[月/](\d{1,2})[日号]?"
-    r"(?:[-:]?(\d{1,2}:\d{2}))?$"
+    r"^(\d{1,2})\s*(?:月|/)\s*(\d{1,2})\s*[日号]?"
+    r"(?:\s*[-:：]?\s*(\d{1,2}:\d{2}))?$"
 )
 _RE_DEADLINE_SUFFIX = re.compile(r"(?:截止前|之前|以前|截止|前)$")
 
@@ -45,7 +47,8 @@ def parse_natural_deadline(text: str) -> str:
     Returns deadline in STORED_DATETIME_FORMAT ('YYYY-MM-DD HH:MM').
     Raises ValueError if no format matches.
     """
-    text = _RE_DEADLINE_SUFFIX.sub("", text.strip())
+    text = re.sub(r"\s+", " ", text.strip())
+    text = _RE_DEADLINE_SUFFIX.sub("", text).strip()
 
     # 1. Try strict format (YYYY-MM-DD-HH:MM)
     try:
@@ -78,8 +81,8 @@ def parse_natural_deadline(text: str) -> str:
     # 3. Weekday: 周五, 这周四, 本周日, 下周一
     m = _RE_WEEKDAY.match(text)
     if m:
-        prefix = m.group(1)
-        weekday_char = m.group(2)
+        prefix = text[:2] if text.startswith(("这周", "本周", "下周")) else "周"
+        weekday_char = m.group(1)
         target_weekday = WEEKDAY_MAP[weekday_char]
         current_weekday = today.weekday()
 
@@ -97,7 +100,7 @@ def parse_natural_deadline(text: str) -> str:
                 days_ahead = 7
 
         target_date = today + timedelta(days=days_ahead)
-        time_str = _resolve_time(m.group(3))
+        time_str = _resolve_time(m.group(2))
         return _format_result(
             datetime.strptime(f"{target_date} {time_str}", STORED_DATETIME_FORMAT)
         )

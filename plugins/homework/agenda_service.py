@@ -5,6 +5,7 @@ from datetime import datetime
 from .assignment_service import list_pending_rows_with_display_ids
 from .course_parser import build_course_key_selector_map, get_all_courses
 from .course_reminder import get_today_schedule_for_user
+from .daily_reminder_service import list_daily_reminder_entries_for_date
 from .database import list_pending_custom_reminders
 from .models import STORED_DATETIME_FORMAT
 
@@ -85,6 +86,15 @@ async def build_agenda_message(user_id: str) -> str:
             (
                 sort_dt,
                 f"  [提醒] #{row['id']} {row['title']} — {day_label} {time_label}".rstrip(),
+            )
+        )
+
+    for row in await list_daily_reminder_entries_for_date(user_id, target_date=now.date()):
+        remind_dt = datetime.strptime(row["remind_at"], STORED_DATETIME_FORMAT)
+        entries.append(
+            (
+                remind_dt,
+                f"  [每日提醒] #{row['id']} {row['title']} — 今天 {remind_dt.strftime('%H:%M')}",
             )
         )
 

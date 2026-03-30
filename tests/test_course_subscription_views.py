@@ -433,12 +433,12 @@ class TestCourseSubscriptionViews:
     async def test_course_reminder_refresh_replaces_stale_due_rows_after_schedule_change(
         self, env_with_users, course_config
     ):
-        today = date.today()
-        date_str = today.strftime("%Y-%m-%d")
+        target_date = date.today() + timedelta(days=1)
+        date_str = target_date.strftime("%Y-%m-%d")
         course_config.write_text(
             json.dumps(
                 {
-                    "semester_start": (today - timedelta(days=today.weekday())).strftime("%Y-%m-%d"),
+                    "semester_start": (target_date - timedelta(days=target_date.weekday())).strftime("%Y-%m-%d"),
                     "period_start_times": {"1": "08:30", "9": "23:00"},
                     "advance_minutes": 30,
                 }
@@ -450,7 +450,7 @@ class TestCourseSubscriptionViews:
             "\n".join(
                 [
                     "课程编号\t课程名称\t项目名称\t课序号\t授课方式\t学分\t课程属性\t上课教师\t上课时间\t上课地点\t上课校区\t选修类型\t选课状态\t操作",
-                    f"sd501\t数据库系统\t\t01\t考试\t3\t必修\t张三\t{_slot_for(today, period='1-2')}\t教学楼101\t示例校区\t主修\t选中",
+                    f"sd501\t数据库系统\t\t01\t考试\t3\t必修\t张三\t{_slot_for(target_date, period='1-2')}\t教学楼101\t示例校区\t主修\t选中",
                 ]
             )
             + "\n",
@@ -488,14 +488,14 @@ class TestCourseSubscriptionViews:
             "\n".join(
                 [
                     "课程编号\t课程名称\t项目名称\t课序号\t授课方式\t学分\t课程属性\t上课教师\t上课时间\t上课地点\t上课校区\t选修类型\t选课状态\t操作",
-                    f"sd501\t数据库系统\t\t01\t考试\t3\t必修\t张三\t{_slot_for(today, period='9-10')}\t教学楼909\t示例校区\t主修\t选中",
+                    f"sd501\t数据库系统\t\t01\t考试\t3\t必修\t张三\t{_slot_for(target_date, period='9-10')}\t教学楼909\t示例校区\t主修\t选中",
                 ]
             )
             + "\n",
             encoding="utf-8",
         )
 
-        await generate_course_reminders_for_date(today)
+        await generate_course_reminders_for_date(target_date)
 
         user1_reminders = await _list_course_reminders("user1")
         user2_reminders = await _list_course_reminders("user2")

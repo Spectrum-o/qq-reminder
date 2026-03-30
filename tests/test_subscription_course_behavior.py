@@ -11,8 +11,13 @@ from plugins.homework.assignment_service import (
     add_manual_assignment,
     sync_homework_reminders_for_user,
 )
-from plugins.homework.commands import _parse_addcourse_args, _split_course_names
-from plugins.homework.course_parser import add_custom_course
+from plugins.homework.commands import (
+    _parse_addcourse_args,
+    _parse_importcourses_block,
+    _split_course_names,
+    build_importcourses_response,
+)
+from plugins.homework.course_parser import add_custom_course, get_all_courses
 from plugins.homework import database as _db_mod
 from plugins.homework.database import (
     count_assignments_by_course,
@@ -20,7 +25,11 @@ from plugins.homework.database import (
     init_db,
     list_pending,
 )
-from plugins.homework.user_service import subscribe_courses, unsubscribe_courses
+from plugins.homework.user_service import (
+    get_user_subscriptions,
+    subscribe_courses,
+    unsubscribe_courses,
+)
 
 
 def test_split_course_names_supports_exact_multiword_match():
@@ -56,6 +65,100 @@ def test_parse_addcourse_args_supports_course_names_with_spaces():
         "English Writing",
         "1-16周 星期三 5-6; 1-16周 星期五 1-2",
     )
+
+
+def test_parse_importcourses_block_supports_code_fence_header_and_optional_fields():
+    rows, error = _parse_importcourses_block(
+        """```text
+课程名 | 时间 | 教师 | 地点
+高等数学 | 1-16周 星期一 1-2 | 张三 | 教学楼101
+英语 | 1-16周 星期三 5-6; 1-16周 星期五 1-2
+```"""
+    )
+
+    assert error is None
+    assert rows == [
+        {
+            "line_no": 2,
+            "name": "高等数学",
+            "time_slots": "1-16周 星期一 1-2",
+            "teacher": "张三",
+            "location": "教学楼101",
+        },
+        {
+            "line_no": 3,
+            "name": "英语",
+            "time_slots": "1-16周 星期三 5-6; 1-16周 星期五 1-2",
+            "teacher": "",
+            "location": "",
+        },
+    ]
+
+
+def test_parse_importcourses_block_reports_clear_guidance_for_space_separated_columns():
+    rows, error = _parse_importcourses_block("高等数学 1-16周 星期一 1-2 张三 教学楼101")
+
+    assert rows == []
+    assert error is not None
+    assert "第1行格式错误" in error
+    assert "列分隔只支持: |、｜ 或 Tab，不支持只用空格分列" in error
+    assert "课程名 | 时间 | 教师 | 地点" in error
+
+
+async def test_importcourses_response_imports_private_courses_and_auto_subscribes(env_with_users):
+    result = await build_importcourses_response(
+        "user1",
+        "\n".join(
+            [
+                "高等数学 | 1-16周 星期一 1-2 | 张三 | 教学楼101",
+                "英语 | 1-16周 星期三 5-6; 1-16周 星期五 1-2 | 李四 | 文学院203",
+            ]
+        ),
+    )
+
+    assert "已导入2门私人课程，已自动订阅" in result
+    assert "高等数学: 1-16周 星期一 1-2 | 教师: 张三 | 地点: 教学楼101" in result
+    assert "英语: 1-16周 星期三 5-6; 1-16周 星期五 1-2 | 教师: 李四 | 地点: 文学院203" in result
+    assert set(await get_user_subscriptions("user1")) == {"高等数学", "英语"}
+
+    private_courses = {
+        course.name: course
+        for course in get_all_courses(user_id="user1")
+        if course.visibility == "private"
+    }
+    assert private_courses["高等数学"].teacher == "张三"
+    assert private_courses["高等数学"].location == "教学楼101"
+    assert private_courses["英语"].teacher == "李四"
+    assert private_courses["英语"].location == "文学院203"
+
+
+async def test_importcourses_response_reports_duplicates_without_blocking_other_rows(env_with_users):
+    add_custom_course("高等数学", "1-16周 星期一 1-2", "private", "user1")
+
+    result = await build_importcourses_response(
+        "user1",
+        "\n".join(
+            [
+                "高等数学 | 1-16周 星期一 1-2",
+                "英语 | 1-16周 星期三 5-6",
+            ]
+        ),
+    )
+
+    assert "已导入1门私人课程，已自动订阅" in result
+    assert "以下1行未导入:" in result
+    assert "第1行: 课程 高等数学 已存在，无法导入" in result
+    assert set(await get_user_subscriptions("user1")) == {"英语"}
+
+
+def test_parse_addcourse_args_failure_should_be_paired_with_clear_usage():
+    from plugins.homework.commands import _format_addcourse_usage, _parse_addcourse_args
+
+    assert _parse_addcourse_args("English Writing 星期三 5-6") is None
+    usage = _format_addcourse_usage()
+    assert "格式: /addcourse <课程名> <时间>" in usage
+    assert "多个时间段用分号分隔" in usage
+    assert "/addcourse English Writing 1-16周 星期三 5-6; 1-16周 星期五 1-2" in usage
 
 
 async def _count_homework_reminders(assignment_id: int, user_id: str) -> int:

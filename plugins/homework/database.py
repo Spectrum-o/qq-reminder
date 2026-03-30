@@ -272,6 +272,31 @@ async def init_db() -> None:
         )
         await db.execute(
             """
+            CREATE TABLE IF NOT EXISTS daily_briefing_deliveries (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id       TEXT NOT NULL,
+                briefing_date TEXT NOT NULL,
+                scheduled_for TEXT NOT NULL,
+                sent_at       TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+                UNIQUE(user_id, briefing_date)
+            )
+            """
+        )
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_reminder_rules (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    TEXT NOT NULL,
+                title      TEXT NOT NULL,
+                hour       INTEGER NOT NULL,
+                minute     INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+                UNIQUE(user_id, title, hour, minute)
+            )
+            """
+        )
+        await db.execute(
+            """
             CREATE TABLE IF NOT EXISTS user_completions (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id       TEXT NOT NULL,
@@ -318,6 +343,9 @@ async def init_db() -> None:
         await _ensure_column(db, "users", "briefing_enabled", "INTEGER NOT NULL DEFAULT 1")
         await _ensure_column(db, "users", "briefing_hour", "INTEGER NOT NULL DEFAULT 8")
         await _ensure_column(db, "users", "briefing_minute", "INTEGER NOT NULL DEFAULT 0")
+        await _ensure_column(db, "users", "briefing_show_courses", "INTEGER NOT NULL DEFAULT 1")
+        await _ensure_column(db, "users", "briefing_show_assignments", "INTEGER NOT NULL DEFAULT 1")
+        await _ensure_column(db, "users", "briefing_show_reminders", "INTEGER NOT NULL DEFAULT 1")
 
         # ── Data migration (single-user → multi-user) ──
 
@@ -363,6 +391,9 @@ async def init_db() -> None:
         )
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_reminders_user ON reminders(user_id, sent, remind_at)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_daily_reminder_rules_user ON daily_reminder_rules(user_id, hour, minute)"
         )
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_user_completions_user ON user_completions(user_id)"
@@ -533,6 +564,7 @@ async def list_pending(user_id: str) -> list[dict]:
             FROM assignments a
             LEFT JOIN user_completions uc ON a.id = uc.assignment_id AND uc.user_id = ?
             WHERE uc.id IS NULL
+              AND datetime(a.deadline) > datetime('now', 'localtime')
               AND EXISTS (
                     SELECT 1
                     FROM user_course_subscriptions ucs
@@ -564,6 +596,7 @@ async def list_undone_assignments(
         FROM assignments a
         LEFT JOIN user_completions uc ON a.id = uc.assignment_id AND uc.user_id = ?
         WHERE uc.id IS NULL
+          AND datetime(a.deadline) > datetime('now', 'localtime')
           AND EXISTS (
                 SELECT 1
                 FROM user_course_subscriptions ucs
@@ -782,15 +815,20 @@ async def sync_reminders(
         db.row_factory = aiosqlite.Row
         async with db.execute(
             """
-            SELECT id, title, body, remind_at
+            SELECT id, title, body, remind_at, sent
             FROM reminders
-            WHERE type = ? AND ref_id = ? AND user_id = ? AND sent = 0
+            WHERE type = ? AND ref_id = ? AND user_id = ?
             """,
             (reminder_type, ref_id, user_id),
         ) as cursor:
             existing_rows = [dict(row) async for row in cursor]
 
-        existing_by_time = {row["remind_at"]: row for row in existing_rows}
+        existing_by_time: dict[str, dict] = {}
+        for row in existing_rows:
+            remind_at = row["remind_at"]
+            current = existing_by_time.get(remind_at)
+            if current is None or (current["sent"] == 1 and row["sent"] == 0):
+                existing_by_time[remind_at] = row
 
         for remind_at, draft in desired_by_time.items():
             existing = existing_by_time.get(remind_at)
@@ -804,14 +842,17 @@ async def sync_reminders(
                 )
                 continue
 
-            if existing["title"] != draft.title or existing["body"] != draft.body:
+            if (
+                existing["sent"] == 0
+                and (existing["title"] != draft.title or existing["body"] != draft.body)
+            ):
                 await db.execute(
                     "UPDATE reminders SET title = ?, body = ? WHERE id = ?",
                     (draft.title, draft.body, existing["id"]),
                 )
 
         for row in existing_rows:
-            if row["remind_at"] not in desired_by_time:
+            if row["sent"] == 0 and row["remind_at"] not in desired_by_time:
                 await db.execute("DELETE FROM reminders WHERE id = ?", (row["id"],))
 
         await db.commit()
@@ -830,6 +871,15 @@ async def get_pending_reminders() -> list[dict]:
             WHERE sent = 0
               AND fail_count < ?
               AND datetime(remind_at) <= datetime('now', 'localtime')
+              AND (
+                    type != 'homework'
+                    OR EXISTS (
+                        SELECT 1
+                        FROM assignments a
+                        WHERE CAST(a.id AS TEXT) = reminders.ref_id
+                          AND datetime(a.deadline) > datetime('now', 'localtime')
+                    )
+                  )
             ORDER BY datetime(remind_at) ASC, id ASC
             """,
             (REMINDER_MAX_FAIL_COUNT,),
@@ -856,6 +906,49 @@ async def increment_reminder_fail_count(reminder_id: int) -> int:
         ) as cursor:
             row = await cursor.fetchone()
             return row[0] if row else 0
+
+
+async def mark_terminal_failed_reminders_sent() -> int:
+    """Normalize reminders that have exhausted retries into a terminal sent state."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            UPDATE reminders
+            SET sent = 1
+            WHERE sent = 0
+              AND fail_count >= ?
+            """,
+            (REMINDER_MAX_FAIL_COUNT,),
+        )
+        await db.commit()
+        return cursor.rowcount
+
+
+async def delete_expired_homework_reminders() -> int:
+    """Delete unsent homework reminders whose assignments are missing or overdue."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            DELETE FROM reminders
+            WHERE sent = 0
+              AND type = 'homework'
+              AND (
+                    NOT EXISTS (
+                        SELECT 1
+                        FROM assignments a
+                        WHERE CAST(a.id AS TEXT) = reminders.ref_id
+                    )
+                    OR EXISTS (
+                        SELECT 1
+                        FROM assignments a
+                        WHERE CAST(a.id AS TEXT) = reminders.ref_id
+                          AND datetime(a.deadline) <= datetime('now', 'localtime')
+                    )
+                  )
+            """
+        )
+        await db.commit()
+        return cursor.rowcount
 
 
 async def delete_reminders_by_ref(
@@ -1291,6 +1384,7 @@ async def count_assignments(
             SELECT COUNT(*) FROM assignments a
             LEFT JOIN user_completions uc ON a.id = uc.assignment_id AND uc.user_id = ?
             WHERE uc.id IS NULL
+              AND datetime(a.deadline) > datetime('now', 'localtime')
               AND EXISTS (
                     SELECT 1
                     FROM user_course_subscriptions ucs
@@ -1358,6 +1452,7 @@ async def count_assignments_by_course(
             SELECT a.course_key, a.course, COUNT(*) FROM assignments a
             LEFT JOIN user_completions uc ON a.id = uc.assignment_id AND uc.user_id = ?
             WHERE uc.id IS NULL
+              AND datetime(a.deadline) > datetime('now', 'localtime')
               AND EXISTS (
                     SELECT 1
                     FROM user_course_subscriptions ucs
@@ -1423,6 +1518,60 @@ async def list_pending_custom_reminders(user_id: str) -> list[dict]:
             (user_id,),
         ) as cursor:
             return [dict(row) async for row in cursor]
+
+
+async def add_daily_reminder_rule(user_id: str, title: str, hour: int, minute: int) -> int | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            cursor = await db.execute(
+                """
+                INSERT INTO daily_reminder_rules (user_id, title, hour, minute)
+                VALUES (?, ?, ?, ?)
+                """,
+                (user_id, title, hour, minute),
+            )
+        except aiosqlite.IntegrityError:
+            return None
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def list_daily_reminder_rules(user_id: str) -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT id, user_id, title, hour, minute, created_at
+            FROM daily_reminder_rules
+            WHERE user_id = ?
+            ORDER BY hour ASC, minute ASC, id ASC
+            """,
+            (user_id,),
+        ) as cursor:
+            return [dict(row) async for row in cursor]
+
+
+async def list_all_daily_reminder_rules() -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT id, user_id, title, hour, minute, created_at
+            FROM daily_reminder_rules
+            ORDER BY user_id ASC, hour ASC, minute ASC, id ASC
+            """
+        ) as cursor:
+            return [dict(row) async for row in cursor]
+
+
+async def delete_daily_reminder_rule(rule_id: int, user_id: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            "DELETE FROM daily_reminder_rules WHERE id = ? AND user_id = ?",
+            (rule_id, user_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
 
 
 async def delete_reminder(reminder_id: int, user_id: str) -> bool:
@@ -1549,6 +1698,7 @@ async def delete_user(qq_id: str) -> bool:
         await db.execute("DELETE FROM user_assignment_aliases WHERE user_id = ?", (qq_id,))
         await db.execute("DELETE FROM user_assignment_display_counters WHERE user_id = ?", (qq_id,))
         await db.execute("DELETE FROM user_course_subscriptions WHERE user_id = ?", (qq_id,))
+        await db.execute("DELETE FROM daily_reminder_rules WHERE user_id = ?", (qq_id,))
         await db.execute("DELETE FROM reminders WHERE user_id = ?", (qq_id,))
         await db.commit()
         return cursor.rowcount > 0
@@ -1577,11 +1727,57 @@ async def get_users_for_briefing_time(hour: int, minute: int) -> list[str]:
             return [row[0] async for row in cursor]
 
 
+async def get_users_for_briefing_window(
+    briefing_date: str,
+    start_minute: int,
+    end_minute: int,
+) -> list[dict]:
+    start_minute = max(0, start_minute)
+    end_minute = min(23 * 60 + 59, end_minute)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT u.qq_id, u.briefing_hour, u.briefing_minute
+            FROM users u
+            LEFT JOIN daily_briefing_deliveries d
+              ON d.user_id = u.qq_id AND d.briefing_date = ?
+            WHERE u.role IN ('root', 'admin', 'user')
+              AND u.briefing_enabled = 1
+              AND ((u.briefing_hour * 60) + u.briefing_minute) BETWEEN ? AND ?
+              AND d.id IS NULL
+            ORDER BY u.briefing_hour ASC, u.briefing_minute ASC, u.qq_id ASC
+            """,
+            (briefing_date, start_minute, end_minute),
+        ) as cursor:
+            return [dict(row) async for row in cursor]
+
+
+async def record_daily_briefing_delivery(
+    user_id: str,
+    briefing_date: str,
+    scheduled_for: str,
+) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT OR IGNORE INTO daily_briefing_deliveries (user_id, briefing_date, scheduled_for)
+            VALUES (?, ?, ?)
+            """,
+            (user_id, briefing_date, scheduled_for),
+        )
+        await db.commit()
+
+
 async def get_briefing_settings(qq_id: str) -> dict | None:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT briefing_enabled, briefing_hour, briefing_minute FROM users WHERE qq_id = ?",
+            """
+            SELECT briefing_enabled, briefing_hour, briefing_minute,
+                   briefing_show_courses, briefing_show_assignments, briefing_show_reminders
+            FROM users WHERE qq_id = ?
+            """,
             (qq_id,),
         ) as cursor:
             row = await cursor.fetchone()
@@ -1603,6 +1799,33 @@ async def set_briefing_enabled(qq_id: str, enabled: bool) -> bool:
         cursor = await db.execute(
             "UPDATE users SET briefing_enabled = ? WHERE qq_id = ?",
             (1 if enabled else 0, qq_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def set_briefing_content(
+    qq_id: str,
+    *,
+    show_courses: bool,
+    show_assignments: bool,
+    show_reminders: bool,
+) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cursor = await db.execute(
+            """
+            UPDATE users
+            SET briefing_show_courses = ?,
+                briefing_show_assignments = ?,
+                briefing_show_reminders = ?
+            WHERE qq_id = ?
+            """,
+            (
+                1 if show_courses else 0,
+                1 if show_assignments else 0,
+                1 if show_reminders else 0,
+                qq_id,
+            ),
         )
         await db.commit()
         return cursor.rowcount > 0

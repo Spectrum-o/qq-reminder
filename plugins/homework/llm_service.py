@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
 from datetime import datetime
 
 import httpx
+from nonebot import get_bot
 from nonebot.log import logger
 from openai import AsyncOpenAI
 
@@ -23,17 +25,23 @@ from .assignment_service import (
 from .config import LLM_API_BASE, LLM_API_KEY, LLM_MODEL
 from .course_parser import add_custom_course, delete_custom_course, is_valid_time_slots
 from .course_service import format_course_catalog, format_today_schedule_for_user
+from .daily_briefing import format_briefing_content_labels
+from .daily_reminder_service import delete_daily_reminder_occurrences, sync_daily_reminder_occurrences
 from .database import (
     add_reminder,
+    add_daily_reminder_rule,
     delete_assignments_by_course,
     delete_course_reminders_for_user_course_keys,
+    delete_daily_reminder_rule,
     delete_homework_reminders_for_user_course_keys,
     delete_homework_reminders_for_user_courses,
     delete_reminder,
     delete_reminders_by_course,
     delete_subscriptions_by_course,
     get_briefing_settings,
+    list_daily_reminder_rules,
     list_pending_custom_reminders,
+    set_briefing_content,
     set_briefing_enabled,
     set_briefing_time,
     toggle_class_notify,
@@ -45,12 +53,15 @@ from .user_service import (
     ROLE_ROOT,
     ROLE_USER,
     approve_user as approve_pending_user,
+    build_role_notice,
+    get_user_role,
     get_user_subscription_selector_map,
     get_user_subscriptions,
     get_user_subscription_names,
     get_visible_course_selectors,
     list_all_users as list_all_user_rows,
     list_pending_users as list_pending_user_rows,
+    promote_user_to_admin,
     resolve_visible_course,
     subscribe_all_courses,
     subscribe_courses,
@@ -87,6 +98,23 @@ def _get_client() -> AsyncOpenAI:
         finally:
             os.environ.update(saved)
     return _client
+
+
+async def _notify_role_change(target_qq: str, role: str, *, promoted: bool = False) -> None:
+    try:
+        bot = get_bot()
+    except ValueError:
+        return
+
+    try:
+        result = bot.send_private_msg(
+            user_id=int(target_qq),
+            message=build_role_notice(role, promoted=promoted),
+        )
+        if inspect.isawaitable(result):
+            await result
+    except Exception as exc:
+        logger.warning(f"Failed to notify role change for {target_qq}: {exc}")
 
 # ── OpenAI function calling tool definitions ─────
 
@@ -215,6 +243,31 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "add_daily_reminder",
+            "description": (
+                "设置一个每天固定时间重复的个人提醒。"
+                "用户说每天/每日几点提醒我做某事时调用。"
+                "这是周期提醒，不要调用 add_custom_reminder。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "提醒内容"},
+                    "time": {
+                        "type": "string",
+                        "description": (
+                            "每天提醒时间，必须是 HH:MM 格式。"
+                            "用户可以说自然语言，但你必须先换算成标准时间再调用。"
+                        ),
+                    },
+                },
+                "required": ["title", "time"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "today_schedule",
             "description": "查看今天的课程安排。",
             "parameters": {"type": "object", "properties": {}},
@@ -225,6 +278,14 @@ TOOLS = [
         "function": {
             "name": "list_reminders",
             "description": "查看所有待发送的自定义提醒。",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_daily_reminders",
+            "description": "查看当前用户已设置的每日提醒规则。",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -249,8 +310,26 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "cancel_daily_reminders",
+            "description": "取消一条或多条每日提醒规则。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reminder_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "每日提醒规则编号数组，按用户提及顺序填写",
+                    },
+                },
+                "required": ["reminder_ids"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_briefing_settings",
-            "description": "查看当前每日早报的状态和时间。当用户问早报几点发送、早报有没有开启时调用。",
+            "description": "查看当前每日早报的状态、时间和显示内容。当用户问早报几点发送、早报有没有开启、早报显示哪些内容时调用。",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -271,6 +350,31 @@ TOOLS = [
                     },
                 },
                 "required": ["value"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_briefing_content",
+            "description": (
+                "修改每日早报显示的内容部分。"
+                "可控制是否显示课程、作业、提醒。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "mode": {
+                        "type": "string",
+                        "description": "修改模式，只能是 set / add / remove",
+                    },
+                    "sections": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "内容部分数组，只能使用 courses / assignments / reminders",
+                    },
+                },
+                "required": ["mode", "sections"],
             },
         },
     },
@@ -393,7 +497,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "approve_user",
-            "description": "审批一个待审核用户。管理员只能审批为普通用户；root 可以审批为普通用户或管理员。",
+            "description": "审批一个待审核用户。管理员只能审批为普通用户；root 可以审批为普通用户或管理员，也可以把现有普通用户提升为管理员。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -420,57 +524,69 @@ ACTION: {"action": "<动作名>", "args": {<参数>}}
 
 可用动作及其参数（必须严格使用下列参数名）:
 
-1. add_custom_reminder - 设置提醒
+1. add_custom_reminder - 设置单次提醒
    args: {"title": "提醒内容", "remind_at": "YYYY-MM-DD HH:MM"}
 
-2. complete_assignments - 标记一条或多条作业完成
+2. add_daily_reminder - 设置每日重复提醒
+   args: {"title": "提醒内容", "time": "HH:MM"}
+
+3. complete_assignments - 标记一条或多条作业完成
    args: {"assignment_ids": [编号1, 编号2]}
 
-3. list_agenda - 查看统一事项总览
+4. list_agenda - 查看统一事项总览
    args: {}
 
-4. list_assignments - 查看作业列表
+5. list_assignments - 查看作业列表
    args: {}
 
-5. list_courses - 查看可见课程目录
+6. list_courses - 查看可见课程目录
    args: {}
 
-6. list_my_courses - 查看已订阅课程
+7. list_my_courses - 查看已订阅课程
    args: {}
 
-7. today_schedule - 查看今日课程
+8. today_schedule - 查看今日课程
    args: {}
 
-8. list_reminders - 查看待发送提醒
+9. list_reminders - 查看待发送的一次性提醒
    args: {}
 
-9. get_briefing_settings - 查看每日早报状态和时间
+10. list_daily_reminders - 查看每日提醒规则
    args: {}
 
-10. set_briefing_time - 设置每日早报时间或开关
+11. get_briefing_settings - 查看每日早报状态、时间和显示内容
+   args: {}
+
+12. set_briefing_time - 设置每日早报时间或开关
    args: {"value": "7:30 / 08:00 / 7点半 / on / off"}
 
-11. cancel_reminders - 取消一条或多条提醒
+13. set_briefing_content - 修改每日早报显示内容
+   args: {"mode": "set / add / remove", "sections": ["courses / assignments / reminders"]}
+
+14. cancel_reminders - 取消一条或多条一次性提醒
    args: {"reminder_ids": [编号1, 编号2]}
 
-12. add_assignment - 添加作业（管理员=公共, 普通用户=私人）
+15. cancel_daily_reminders - 取消一条或多条每日提醒规则
+   args: {"reminder_ids": [编号1, 编号2]}
+
+16. add_assignment - 添加作业（管理员=公共, 普通用户=私人）
    args: {"course": "课程名", "deadline": "YYYY-MM-DD HH:MM", "description": "描述"}
 
-13. delete_assignments - 删除一条或多条作业（管理员删公共, 用户删自己的私人）
+17. delete_assignments - 删除一条或多条作业（管理员删公共, 用户删自己的私人）
    args: {"assignment_ids": [编号1, 编号2]}
 
-14. subscribe_courses - 订阅一门或多门现有课程
+18. subscribe_courses - 订阅一门或多门现有课程
     args: {"course_selectors": ["大学英语#sd101", "高等数学"]}
     必须使用精确课程 selector；同名公共课不能省略 #课程编号
 
-15. subscribe_all_courses - 订阅全部可见课程
+19. subscribe_all_courses - 订阅全部可见课程
     args: {}
 
-16. unsubscribe_courses - 退订一门或多门已订阅课程
+20. unsubscribe_courses - 退订一门或多门已订阅课程
     args: {"course_selectors": ["大学英语#sd101", "高等数学"]}
     必须使用精确课程 selector；同名公共课不能省略 #课程编号
 
-17. add_course - 添加课程（管理员添加公共课程，普通用户添加私人课程）
+21. add_course - 添加课程（管理员添加公共课程，普通用户添加私人课程）
    args: {"name": "课程名", "time_slots": "时间，必须是标准格式: X-Y周 星期Z A-B"}
    时间格式说明:
    - X-Y周 = 上课的周数范围，如 1-18周、1-16周
@@ -479,24 +595,25 @@ ACTION: {"action": "<动作名>", "args": {<参数>}}
    - 多个时间段用分号分隔: "1-18周 星期一 3-4; 1-18周 星期三 5-6"
    用户可能用各种自然语言描述，你必须转换为标准格式
 
-18. delete_course - 删除课程
+22. delete_course - 删除课程
     args: {"name": "课程名"}
 
-19. toggle_course_notify - 开启/关闭某课程的上课提醒（早上7:30+课前提醒）
+23. toggle_course_notify - 开启/关闭某课程的上课提醒（早上7:30+课前提醒）
     args: {"name": "课程名"}
     同名公共课请优先使用精确课程名，如 大学英语#sd101
 
-20. list_pending_users - 查看待审核用户（仅管理员和 root）
+24. list_pending_users - 查看待审核用户（仅管理员和 root）
     args: {}
 
-21. list_all_users - 查看所有用户及其角色（仅 root）
+25. list_all_users - 查看所有用户及其角色（仅 root）
     args: {}
 
-22. approve_user - 审批待审核用户
+26. approve_user - 审批待审核用户，或把现有普通用户提升为管理员
     args: {"qq_id": "QQ号", "role": "user 或 admin，默认 user"}
     权限说明:
     - admin 只能审批为 user
-    - root 可以审批为 user 或 admin
+    - root 可以审批 pending 用户为 user 或 admin
+    - root 也可以把现有 user 提升为 admin
 
 示例:
 用户: 4月15日下午3点提醒我开会
@@ -506,6 +623,18 @@ ACTION: {"action": "add_custom_reminder", "args": {"title": "开会", "remind_at
 用户: 4月16日下午5点提醒我拿快递
 回复: 没问题，4 月 16 日下午 5 点我会提醒你去拿快递。
 ACTION: {"action": "add_custom_reminder", "args": {"title": "拿快递", "remind_at": "2026-04-16 17:00"}}
+
+用户: 每天早上8点提醒我吃维生素
+回复: 好的，我帮你设成每天早上 8 点提醒。
+ACTION: {"action": "add_daily_reminder", "args": {"title": "吃维生素", "time": "08:00"}}
+
+用户: 看看我的每日提醒
+回复:
+ACTION: {"action": "list_daily_reminders", "args": {}}
+
+用户: 删掉每日提醒 2 和 4
+回复: 好的，我帮你删掉。
+ACTION: {"action": "cancel_daily_reminders", "args": {"reminder_ids": [2, 4]}}
 
 用户: 我的作业有哪些
 回复:
@@ -555,6 +684,14 @@ ACTION: {"action": "get_briefing_settings", "args": {}}
 回复: 好的，我帮你把每日早报调整到早上7点半。
 ACTION: {"action": "set_briefing_time", "args": {"value": "7:30"}}
 
+用户: 早报只保留作业和提醒
+回复: 好的，我帮你调整早报内容。
+ACTION: {"action": "set_briefing_content", "args": {"mode": "set", "sections": ["assignments", "reminders"]}}
+
+用户: 早报里加上课程
+回复: 好的，我帮你把课程加回早报。
+ACTION: {"action": "set_briefing_content", "args": {"mode": "add", "sections": ["courses"]}}
+
 用户: 先把早报关掉
 回复: 好的，我先帮你关闭每日早报。
 ACTION: {"action": "set_briefing_time", "args": {"value": "off"}}
@@ -587,6 +724,10 @@ ACTION: {"action": "list_all_users", "args": {}}
 回复: 好的，已通过 123456789 的注册。
 ACTION: {"action": "approve_user", "args": {"qq_id": "123456789", "role": "user"}}
 
+用户: 把 123456789 设为管理员
+回复: 好的，已将 123456789 设置为管理员。
+ACTION: {"action": "approve_user", "args": {"qq_id": "123456789", "role": "admin"}}
+
 用户: 我可以给计算理论添加作业吗
 回复: 可以。直接发“课程名 + 截止时间 + 作业内容”就行，比如“计算理论这周四之前交纸质作 1.4a”。
 
@@ -594,13 +735,17 @@ ACTION: {"action": "approve_user", "args": {"qq_id": "123456789", "role": "user"
 回复: 我现在还不能直接修改已有作业，你先 /list 看编号，删除旧作业后再把新的截止时间和内容发给我。
 
 重要: args 里的参数名必须严格使用上面列出的名称（如 title、remind_at、time_slots），不要用其他名称。
+重要: 用户说 每天/每日/每天都 这种周期提醒时，优先使用 add_daily_reminder，不要误用 add_custom_reminder。
 重要: complete_assignments.assignment_ids 和 delete_assignments.assignment_ids 必须使用用户当前 /list 里看到的作业编号。
 重要: 涉及多个作业编号时，必须使用数组一次性表达，不要只挑一个编号执行。
 重要: cancel_reminders.reminder_ids 必须使用用户当前提醒列表里看到的提醒编号；涉及多个提醒时必须使用数组。
+重要: cancel_daily_reminders.reminder_ids 必须使用用户当前每日提醒列表里看到的规则编号。
 重要: subscribe_courses.course_selectors 和 unsubscribe_courses.course_selectors 必须使用精确课程 selector；同名公共课必须保留 #课程编号。
 重要: add_assignment 只用于新增作业；如果用户是在问是否支持、怎么用，或是在修改已有作业，不要输出 ACTION。
 重要: 如果新增作业缺课程、截止时间、作业内容中的任一项，先追问，不要输出带空字符串的 ACTION。
+重要: set_briefing_content.sections 只能使用 courses / assignments / reminders；至少保留一项。
 重要: add_assignment.deadline 和 add_custom_reminder.remind_at 必须是 YYYY-MM-DD HH:MM。
+重要: add_daily_reminder.time 必须是 HH:MM。
 重要: 不要把 明天、这周四之前、下周一上午 这种自然语言直接放进 ACTION；必须先换算成标准时间。
 
 如果不需要执行操作（纯聊天或回答问题），直接用自然语言回复即可，不要附 ACTION 行。
@@ -658,8 +803,57 @@ def _format_briefing_settings(settings: dict) -> str:
     return (
         "当前早报设置:\n"
         f"状态: {status}\n"
-        f"时间: {settings['briefing_hour']:02d}:{settings['briefing_minute']:02d}"
+        f"时间: {settings['briefing_hour']:02d}:{settings['briefing_minute']:02d}\n"
+        f"内容: {format_briefing_content_labels(settings)}"
     )
+
+
+_BRIEFING_CONTENT_SECTION_ALIASES = {
+    "courses": {"courses", "course", "课程", "课表"},
+    "assignments": {"assignments", "assignment", "作业", "任务"},
+    "reminders": {"reminders", "reminder", "提醒", "待办"},
+}
+
+
+def _parse_briefing_content_args(args: dict) -> tuple[str | None, list[str] | None, str | None]:
+    raw_mode = str(args.get("mode") or "").strip().lower()
+    mode_aliases = {
+        "set": "set",
+        "replace": "set",
+        "only": "set",
+        "add": "add",
+        "include": "add",
+        "remove": "remove",
+        "hide": "remove",
+        "delete": "remove",
+    }
+    mode = mode_aliases.get(raw_mode)
+    if mode is None:
+        return None, None, "早报内容修改模式错误，请使用 set / add / remove"
+
+    raw_sections = args.get("sections")
+    if not isinstance(raw_sections, list):
+        return None, None, "请提供要调整的早报内容部分"
+
+    sections: list[str] = []
+    for item in raw_sections:
+        normalized = str(item).strip().lower()
+        matched_key = next(
+            (
+                key
+                for key, aliases in _BRIEFING_CONTENT_SECTION_ALIASES.items()
+                if normalized in {alias.lower() for alias in aliases}
+            ),
+            None,
+        )
+        if matched_key is None:
+            return None, None, "早报内容部分只能使用 courses / assignments / reminders"
+        if matched_key not in sections:
+            sections.append(matched_key)
+
+    if not sections:
+        return None, None, "至少保留一项早报内容"
+    return mode, sections, None
 
 
 def _format_add_assignment_usage() -> str:
@@ -811,6 +1005,17 @@ async def _validate_pending_reminder_ids(
     return None
 
 
+async def _validate_daily_reminder_rule_ids(
+    user_id: str, reminder_ids: list[int]
+) -> str | None:
+    rows = await list_daily_reminder_rules(user_id)
+    available_ids = {int(row["id"]) for row in rows}
+    for reminder_id in reminder_ids:
+        if reminder_id not in available_ids:
+            return f"未找到编号 #{reminder_id} 的每日提醒"
+    return None
+
+
 async def _validate_visible_course_selectors(selectors: list[str], user_id: str) -> str | None:
     visible_selectors = set(get_visible_course_selectors(user_id))
     invalid = [selector for selector in selectors if selector not in visible_selectors]
@@ -898,6 +1103,18 @@ def _parse_briefing_value(raw: str) -> tuple[str, int | None, int | None] | None
     return None
 
 
+def _parse_daily_reminder_time(raw: str) -> tuple[int, int] | None:
+    value = str(raw).strip()
+    match = re.fullmatch(r"(\d{1,2})\s*:\s*(\d{2})", value)
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return hour, minute
+
+
 def _is_admin_or_above(role: str | None) -> bool:
     return role in (ROLE_ROOT, ROLE_ADMIN)
 
@@ -919,16 +1136,23 @@ def _build_system_prompt(context: str, use_json_fallback: bool, role: str | None
         "明确说明当前不能直接修改已有作业，并建议先删除旧作业再重新添加。\n"
         "当你输出 add_assignment.deadline 或 add_custom_reminder.remind_at 时，"
         "必须使用 YYYY-MM-DD HH:MM 绝对时间格式；不要输出 明天、周五、这周四之前 这类自然语言。\n"
+        "当你输出 add_daily_reminder.time 时，必须使用 HH:MM；"
+        "如果用户说 每天/每日 固定时间提醒，优先使用 add_daily_reminder，不要误用 add_custom_reminder。\n"
         "如果你无法把时间唯一换算成标准时间，就先追问，不要输出模糊时间。\n"
         "涉及作业完成或删除时，优先使用批量动作 complete_assignments / delete_assignments；"
         "即使只有 1 个编号，也要用 assignment_ids 数组表达。\n"
         "涉及提醒取消时，优先使用批量动作 cancel_reminders；"
+        "即使只有 1 个编号，也要用 reminder_ids 数组表达。\n"
+        "涉及每日提醒删除时，优先使用 cancel_daily_reminders；"
         "即使只有 1 个编号，也要用 reminder_ids 数组表达。\n"
         "涉及课程订阅或退订时，优先使用 list_courses / list_my_courses 查看上下文，"
         "再使用 subscribe_courses / unsubscribe_courses / subscribe_all_courses；"
         "course_selectors 必须使用精确课程 selector，同名公共课必须保留 #课程编号。\n"
         "涉及每日早报时间或开关时，不要当成普通提醒，优先使用 get_briefing_settings 或 set_briefing_time；"
         "如果用户只说想修改早报但没给目标时间，可以先追问具体时间。\n"
+        "涉及每日早报显示内容时，优先使用 get_briefing_settings 或 set_briefing_content；"
+        "set_briefing_content.sections 只能使用 courses / assignments / reminders；"
+        "如果用户只说想修改早报内容但没说要显示哪些部分，可以先追问。\n"
         "涉及课程操作时，优先使用当前上下文里的精确课程名；"
         "如果课程名带 #课程编号，必须完整保留，不要省略。\n"
         f"\n当前时间: {now.strftime('%Y-%m-%d %H:%M')} {_weekday_now()}\n"
@@ -1231,6 +1455,44 @@ async def _execute_tool(name: str, args: dict, user_id: str, role: str | None) -
                 return "用户不存在"
             return f"已设置每日早报时间为 {hour:02d}:{minute:02d}"
 
+        if name == "set_briefing_content":
+            settings = await get_briefing_settings(user_id)
+            if settings is None:
+                return "用户不存在"
+
+            mode, sections, error = _parse_briefing_content_args(args)
+            if error:
+                return error
+            assert mode is not None and sections is not None
+
+            current = {
+                "courses": bool(settings.get("briefing_show_courses", 1)),
+                "assignments": bool(settings.get("briefing_show_assignments", 1)),
+                "reminders": bool(settings.get("briefing_show_reminders", 1)),
+            }
+            if mode == "set":
+                updated = {key: key in sections for key in current}
+            elif mode == "add":
+                updated = {key: (value or key in sections) for key, value in current.items()}
+            else:
+                updated = {key: (value and key not in sections) for key, value in current.items()}
+
+            if not any(updated.values()):
+                return "至少保留一项早报内容"
+
+            ok = await set_briefing_content(
+                user_id,
+                show_courses=updated["courses"],
+                show_assignments=updated["assignments"],
+                show_reminders=updated["reminders"],
+            )
+            if not ok:
+                return "用户不存在"
+            refreshed = await get_briefing_settings(user_id)
+            if refreshed is None:
+                return "用户不存在"
+            return f"已设置早报内容为: {format_briefing_content_labels(refreshed)}"
+
         if name == "add_custom_reminder":
             time_str = args.get("remind_at") or args.get("time") or args.get("datetime") or ""
             title = args.get("title") or args.get("content") or args.get("message") or ""
@@ -1255,6 +1517,25 @@ async def _execute_tool(name: str, args: dict, user_id: str, role: str | None) -
             )
             return f"已设置提醒: {title} ({remind_at})"
 
+        if name == "add_daily_reminder":
+            time_str = args.get("time") or args.get("remind_time") or ""
+            title = args.get("title") or args.get("content") or args.get("message") or ""
+            if not time_str or not title:
+                return "请提供每日提醒时间和内容"
+            parsed_time = _parse_daily_reminder_time(time_str)
+            if parsed_time is None:
+                return "每日提醒时间格式错误，请使用 HH:MM，例如 08:30"
+            hour, minute = parsed_time
+            rule_id = await add_daily_reminder_rule(user_id, title, hour, minute)
+            if rule_id is None:
+                return f"每日提醒已存在: 每天 {hour:02d}:{minute:02d} {title}"
+            await sync_daily_reminder_occurrences(
+                user_id,
+                now=datetime.now(),
+                skip_past_today=True,
+            )
+            return f"已添加每日提醒 #{rule_id}: 每天 {hour:02d}:{minute:02d} {title}"
+
         if name == "today_schedule":
             return await format_today_schedule_for_user(user_id)
 
@@ -1272,6 +1553,17 @@ async def _execute_tool(name: str, args: dict, user_id: str, role: str | None) -
                     lines.append(f"  #{r['id']}  {day} {remind_dt.strftime('%H:%M')}  {r['title']}")
                 except ValueError:
                     lines.append(f"  #{r['id']}  {r['remind_at']}  {r['title']}")
+            return "\n".join(lines)
+
+        if name == "list_daily_reminders":
+            rows = await list_daily_reminder_rules(user_id)
+            if not rows:
+                return "没有每日提醒"
+            lines = ["每日提醒:"]
+            for row in rows:
+                lines.append(
+                    f"  #{row['id']}  每天 {row['hour']:02d}:{row['minute']:02d}  {row['title']}"
+                )
             return "\n".join(lines)
 
         if name in {"cancel_reminders", "cancel_reminder"}:
@@ -1295,6 +1587,29 @@ async def _execute_tool(name: str, args: dict, user_id: str, role: str | None) -
 
             shown_ids = "、".join(f"#{reminder_id}" for reminder_id in reminder_ids)
             return f"已取消提醒 {shown_ids}"
+
+        if name in {"cancel_daily_reminders", "cancel_daily_reminder"}:
+            reminder_ids, error = _parse_positive_int_array_arg(
+                args,
+                array_key="reminder_ids",
+                single_key="reminder_id",
+                label="每日提醒",
+            )
+            if error:
+                return error
+            assert reminder_ids is not None
+            validation_error = await _validate_daily_reminder_rule_ids(user_id, reminder_ids)
+            if validation_error:
+                return f"{validation_error}，未执行删除"
+
+            for reminder_id in reminder_ids:
+                ok = await delete_daily_reminder_rule(reminder_id, user_id)
+                if not ok:
+                    return f"每日提醒 #{reminder_id} 删除失败，已中止"
+                await delete_daily_reminder_occurrences(reminder_id, user_id)
+
+            shown_ids = "、".join(f"#{reminder_id}" for reminder_id in reminder_ids)
+            return f"已删除每日提醒 {shown_ids}"
 
         if name == "subscribe_courses":
             course_selectors, error = _parse_course_selectors_arg(args)
@@ -1444,10 +1759,26 @@ async def _execute_tool(name: str, args: dict, user_id: str, role: str | None) -
             if target_role == ROLE_ADMIN and role != ROLE_ROOT:
                 return "只有 root 可以把用户审批为管理员"
 
+            current_role = await get_user_role(target_qq)
+            if target_role == ROLE_ADMIN:
+                if current_role is None:
+                    return f"审核失败: 用户 {target_qq} 不存在"
+                if current_role == ROLE_ROOT:
+                    return "不能调整 root 的角色"
+                if current_role == ROLE_ADMIN:
+                    return f"{target_qq} 已经是管理员"
+                if current_role == ROLE_USER:
+                    ok = await promote_user_to_admin(target_qq, user_id)
+                    if not ok:
+                        return f"设置失败: 无法将 {target_qq} 提升为管理员"
+                    await _notify_role_change(target_qq, ROLE_ADMIN, promoted=True)
+                    return f"已将 {target_qq} 设置为管理员"
+
             ok = await approve_pending_user(target_qq, user_id, target_role)
             if not ok:
                 return f"审核失败: 用户 {target_qq} 不存在或已审核"
 
+            await _notify_role_change(target_qq, target_role, promoted=False)
             role_label = "管理员" if target_role == ROLE_ADMIN else "用户"
             return f"已通过 {target_qq} 的注册 (角色: {role_label})"
 

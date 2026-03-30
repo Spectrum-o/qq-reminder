@@ -21,11 +21,11 @@ PUBLIC_BOT_GUIDE = """
 - /agenda 查看统一事项总览
 - /list /add /done /delete /stats /rules 管理作业型事项
 - /remind /reminders /cancel 管理个人提醒
-- /today /courses /briefing /briefing_time /notify 查看课程和提醒
+- /today /courses /briefing /briefing_time /briefing_content /notify 查看课程和提醒
 - /approve 是管理员命令；/users 仅 root 可用
 
 自然语言:
-- 审批通过后，可以直接用自然语言查看事项、添加作业型事项、设置提醒、查看课程，也可以查看或调整每日早报时间。
+- 审批通过后，可以直接用自然语言查看事项、添加作业型事项、设置提醒、查看课程，也可以查看或调整每日早报时间与内容。
 - 管理员还可以通过自然语言管理公共作业型事项和公共课程。
 - 管理员还可以通过自然语言查看待审核用户并审批普通用户；root 还可以通过自然语言查看所有用户及其角色，并授予管理员。
 - 未审批用户可以询问公开功能和使用方式，但不能执行个人操作。
@@ -308,7 +308,7 @@ def get_local_public_reply(text: str) -> str | None:
         ),
     ):
         return (
-            "提醒相关命令有 /remind、/reminders、/cancel。"
+            "提醒相关命令有 /remind、/reminders、/cancel、/dailyremind、/dailyreminds、/canceldaily。"
             "如果想把课程、作业和提醒放到一个总览里看，可以用 /agenda。"
             "审批通过后也可以直接用自然语言说“明天下午 3 点提醒我开会”。"
         )
@@ -325,8 +325,9 @@ def get_local_public_reply(text: str) -> str | None:
         ),
     ):
         return (
-            "课程相关命令有 /today、/courses、/briefing、/notify、/addcourse、/delcourse。"
-            "/notify 可以开关上课提醒。公共课程名全局唯一；私人课程名仅对自己唯一。"
+            "课程相关命令有 /today、/courses、/briefing、/briefing_time、/briefing_content、/notify、/addcourse、/importcourses、/delcourse。"
+            "/importcourses 支持按固定格式批量导入课表；/notify 可以开关上课提醒。"
+            "公共课程名全局唯一；私人课程名仅对自己唯一。"
         )
 
     if _contains_any(
